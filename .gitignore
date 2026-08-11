@@ -1,0 +1,21 @@
+# Сборка
+/target
+/target-next
+**/target
+
+# Ядро Xray не хранится в репозитории: это отдельный проект под своей
+# лицензией (MPL-2.0), и его бинарь весит десятки мегабайт. Устанавливается
+# в C:\ProgramData\Sont\core при развёртывании.
+/vendor/
+
+# Фронтенд
+node_modules
+dist
+.vite
+*.local
+
+# Прочее
+.DS_Store
+Thumbs.db
+*.pdb
+*.log

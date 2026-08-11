@@ -1,0 +1,18 @@
+[package]
+name = "sont-sub"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Разбор подписок и ссылок на серверы"
+
+[dependencies]
+sont-core.workspace = true
+
+base64.workspace = true
+percent-encoding.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+url.workspace = true

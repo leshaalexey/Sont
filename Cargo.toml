@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/sont-core",
+    "crates/sont-ipc",
+    "crates/sont-sub",
+    "crates/sont-xray",
+    "crates/sont-daemon",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/sont-vpn/sont"
+
+[workspace.dependencies]
+sont-core = { path = "crates/sont-core" }
+sont-ipc = { path = "crates/sont-ipc" }
+sont-sub = { path = "crates/sont-sub" }
+sont-xray = { path = "crates/sont-xray" }
+
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "signal"] }
+tokio-util = { version = "0.7", features = ["codec", "rt"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+libc = "0.2"
+windows-sys = "0.61"
+base64 = "0.22"
+url = "2"
+percent-encoding = "2"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip", "brotli", "deflate", "charset", "socks"] }
+sha2 = "0.10"
+tun2proxy = { version = "0.8", default-features = false }
+windows-service = "0.8"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
