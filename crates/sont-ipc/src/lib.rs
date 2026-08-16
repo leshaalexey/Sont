@@ -38,7 +38,7 @@ pub use client::{Client, ClientError};
 pub use endpoint::endpoint_name;
 pub use peer::{AuthPolicy, PeerIdentity};
 pub use protocol::{
-    DaemonInfo, Event, Frame, Hello, IpcError, ProxyEndpoints, Request, Response, ServerView,
-    StatusSnapshot, SubscriptionStatus,
+    DaemonInfo, Event, Frame, Hello, IpcError, ProxyEndpoints, Request, Response, ServerFailure,
+    ServerView, StatusSnapshot, SubscriptionStatus,
 };
 pub use sont_core::PROTOCOL_VERSION;

@@ -137,6 +137,16 @@ pub struct Shadowsocks {
     /// Например `2022-blake3-aes-128-gcm`, `aes-256-gcm`, `chacha20-ietf-poly1305`.
     pub method: String,
     pub password: Secret,
+    /// Имя плагина SIP003 из ссылки: `obfs-local`, `v2ray-plugin`, `shadow-tls`.
+    ///
+    /// Хранится не для того, чтобы его запускать, а чтобы честно отказать.
+    /// Плагин — это отдельный исполняемый файл, который Shadowsocks запускает
+    /// рядом с собой; у Xray такого механизма нет вовсе. Выбросив это поле при
+    /// разборе, мы получили бы профиль, который выглядит рабочим, принимается
+    /// ядром — и молча не соединяется, потому что сервер ждёт обфускации,
+    /// которой нет.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub plugin: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -315,6 +325,7 @@ mod tests {
         let ss = Transport::Shadowsocks(Shadowsocks {
             method: "aes-256-gcm".into(),
             password: Secret::new("pw"),
+            plugin: None,
         });
         assert!(!ss.is_udp_based());
     }
@@ -324,6 +335,7 @@ mod tests {
         let t = Transport::Shadowsocks(Shadowsocks {
             method: "aes-256-gcm".into(),
             password: Secret::new("hunter2"),
+            plugin: None,
         });
         assert!(!format!("{t:?}").contains("hunter2"));
     }

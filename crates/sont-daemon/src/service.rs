@@ -130,6 +130,56 @@ pub fn uninstall() -> Result<()> {
     Ok(())
 }
 
+/// Приводит службу в рабочее состояние: ставит, чинит и запускает.
+///
+/// # Зачем отдельная команда
+///
+/// Это то, что делает трей при запуске, и делать он это обязан одним вызовом.
+/// Установка и запуск требуют прав администратора; два вызова — это два окна
+/// повышения прав подряд, после которых пользователь перестаёт их читать.
+///
+/// «Чинит» — про службу, оставшуюся от прошлой сборки: путь в ней указывает на
+/// файл, которого уже нет. Запуск такой службы кончается ошибкой диспетчера,
+/// по которой нельзя догадаться, в чём дело.
+pub fn setup() -> Result<()> {
+    let exe = std::env::current_exe().context("не удалось определить путь к собственному файлу")?;
+
+    match installed_command()? {
+        None => install()?,
+        Some(command) => {
+            let ours = exe.to_string_lossy().to_lowercase();
+            if !command.to_lowercase().contains(&ours) {
+                tracing::info!(%command, "служба указывает на другой файл, переустанавливаю");
+                uninstall()?;
+                install()?;
+            }
+        }
+    }
+
+    start()
+}
+
+/// Командная строка, с которой зарегистрирована служба.
+///
+/// Именно строка, а не путь: в `lpBinaryPathName` лежит и файл, и аргументы
+/// (`service run`), поэтому сравнивать её с путём можно только вхождением.
+fn installed_command() -> Result<Option<String>> {
+    let Ok(manager) = manager(ServiceManagerAccess::CONNECT) else {
+        return Ok(None);
+    };
+    match manager.open_service(SERVICE_NAME, ServiceAccess::QUERY_CONFIG) {
+        Ok(service) => Ok(Some(
+            service
+                .query_config()
+                .context("не удалось прочитать настройки службы")?
+                .executable_path
+                .to_string_lossy()
+                .into_owned(),
+        )),
+        Err(_) => Ok(None),
+    }
+}
+
 pub fn start() -> Result<()> {
     let manager = manager(ServiceManagerAccess::CONNECT)?;
     let service = manager

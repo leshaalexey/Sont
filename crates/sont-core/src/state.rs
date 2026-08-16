@@ -77,6 +77,27 @@ impl TunnelState {
         matches!(self, Self::Connected { .. })
     }
 
+    /// Держит ли демон путь для трафика — уже или вот-вот.
+    ///
+    /// Отличается от [`Self::is_connected`] тем, что включает попытку
+    /// подключения, и нужно там, где важно намерение, а не факт.
+    ///
+    /// Единственный такой случай — объявление адреса локального прокси
+    /// системе. Объявлять его строго по факту соединения нельзя: сначала
+    /// снимается прежний путь, и только через несколько секунд появляется
+    /// новый. В это окно приложения успевают переустановить соединения
+    /// напрямую — и остаются в нём надолго, потому что уже открытые сокеты
+    /// на появившийся прокси никто не переносит, а HTTP/2 и WebSocket живут
+    /// часами. Прокси, объявленный на пару секунд раньше ядра, даёт отказ в
+    /// соединении — и приложение повторяет попытку. Прокси, объявленный
+    /// позже, даёт молчаливый обход.
+    pub fn holds_a_route(&self) -> bool {
+        matches!(
+            self,
+            Self::Connected { .. } | Self::Connecting { .. } | Self::Reconnecting { .. }
+        )
+    }
+
     /// Идёт работа: пользователю нужно показывать индикатор процесса.
     pub fn is_busy(&self) -> bool {
         matches!(
@@ -152,6 +173,34 @@ mod tests {
         };
         assert!(s.is_blocked());
         assert!(s.is_busy());
+    }
+
+    #[test]
+    fn a_route_is_held_through_the_whole_reconnect() {
+        // Адрес локального прокси объявляется системе по этому признаку.
+        // Сузить его до «подключено» значит открыть окно, в которое
+        // приложения уходят напрямую и там остаются.
+        let connecting = TunnelState::Connecting {
+            server: ProfileId::from_raw("srv"),
+            attempt: 1,
+        };
+        let reconnecting = TunnelState::Reconnecting {
+            server: ProfileId::from_raw("srv"),
+            cause: ReconnectCause::CoreExited { code: Some(1) },
+            attempt: 2,
+        };
+        assert!(connecting.holds_a_route());
+        assert!(reconnecting.holds_a_route());
+
+        // А здесь пути нет и не предвидится: объявлять адрес, за которым
+        // никого не будет, — это «пропал интернет» без всякой связи с VPN.
+        assert!(!TunnelState::default().holds_a_route());
+        assert!(!TunnelState::Disconnecting.holds_a_route());
+        assert!(!TunnelState::Failed {
+            error: crate::TunnelError::NoUsableServers,
+            blocked: false,
+        }
+        .holds_a_route());
     }
 
     #[test]

@@ -1,0 +1,18 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<!--
+  Никаких внешних адресов. Клиент VPN, который при открытии окна ходит за
+  шрифтом или скриптом наружу, выдаёт сам факт своего запуска — ровно то, ради
+  сокрытия чего его и включают. Всё, что нужно окну, лежит в сборке.
+-->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'none'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; font-src 'self'; script-src 'self'; connect-src ipc: http://ipc.localhost">
+<title>Sont</title>
+</head>
+<body>
+<div id="app"></div>
+<script type="module" src="/src/main.js"></script>
+</body>
+</html>

@@ -36,8 +36,19 @@ pub fn favorites_file() -> PathBuf {
     data_dir().join("favorites.json")
 }
 
-/// Зашифрованный ключ подписки.
-pub fn subscription_file() -> PathBuf {
+/// Все подписки одним зашифрованным файлом.
+///
+/// Ключи, разобранные серверы и показатели панели лежат вместе: разнеси их по
+/// файлам — и рано или поздно получишь ключ без серверов или серверы от
+/// удалённой подписки, потому что одна из записей не сохранилась.
+pub fn subscriptions_file() -> PathBuf {
+    data_dir().join("subscriptions.bin")
+}
+
+/// Зашифрованный ключ единственной подписки — раскладка до появления списка.
+///
+/// Читается один раз, ради переноса, и после него удаляется.
+pub fn legacy_subscription_file() -> PathBuf {
     data_dir().join("subscription.bin")
 }
 
@@ -72,11 +83,12 @@ pub fn core_config() -> PathBuf {
     data_dir().join("xray-config.json")
 }
 
-/// Зашифрованный кэш разобранной подписки.
+/// Зашифрованный кэш разобранной подписки — раскладка до появления списка.
 ///
 /// Шифруется наравне с самим ключом: в разобранных профилях лежат UUID и
-/// пароли от серверов, то есть ровно тот же платный доступ.
-pub fn servers_cache_file() -> PathBuf {
+/// пароли от серверов, то есть ровно тот же платный доступ. Читается один раз,
+/// ради переноса.
+pub fn legacy_servers_cache_file() -> PathBuf {
     data_dir().join("servers.bin")
 }
 
@@ -90,8 +102,8 @@ mod tests {
         assert!(root.is_absolute(), "путь должен быть абсолютным: {}", root.display());
         assert!(settings_file().starts_with(&root));
         assert!(favorites_file().starts_with(&root));
-        assert!(subscription_file().starts_with(&root));
-        assert!(servers_cache_file().starts_with(&root));
+        assert!(subscriptions_file().starts_with(&root));
+        assert!(legacy_servers_cache_file().starts_with(&root));
     }
 
     #[cfg(windows)]

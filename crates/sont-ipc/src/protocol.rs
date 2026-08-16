@@ -2,8 +2,8 @@
 
 use serde::{Deserialize, Serialize};
 use sont_core::{
-    ProbeResult, ProfileId, Secret, ServerProfile, Settings, SettingsPatch, Stats, SubscriptionId,
-    SubscriptionInfo, TransportKind, TunnelError, TunnelState,
+    ProbeResult, ProfileId, ReconnectCause, Secret, ServerProfile, Settings, SettingsPatch, Stats,
+    SubscriptionId, SubscriptionInfo, TransportKind, TunnelError, TunnelState,
 };
 
 /// Кадр, летящий по каналу в любую сторону.
@@ -67,19 +67,56 @@ pub enum Request {
         server: Option<ProfileId>,
     },
     Disconnect,
-    /// Задать ключ подписки. Демон проверяет URL и сразу пытается его прочитать.
-    SetSubscription {
+    /// Добавить подписку. Демон проверяет URL и сразу пытается её прочитать.
+    ///
+    /// Повторное добавление той же ссылки — не ошибка и не дубликат: ключ
+    /// перезаписывается, а подписка перечитывается. Пользователь, вставивший
+    /// ссылку дважды, ожидает именно этого.
+    AddSubscription {
         url: Secret,
     },
-    /// Удалить подписку и все связанные с ней серверы.
+    /// Удалить одну подписку и пришедшие из неё серверы.
+    RemoveSubscription {
+        id: SubscriptionId,
+    },
+    ListSubscriptions,
+    /// Отдать ключ подписки в открытом виде.
+    ///
+    /// Единственный способ получить его наружу, и он намеренно отдельный:
+    /// обычный `ListSubscriptions` возвращает маску, потому что показать
+    /// подписку в списке можно и без ключа. Ключ нужен ровно для двух
+    /// действий пользователя — скопировать и показать QR, чтобы перенести
+    /// подписку на телефон, — и запрашивается только в этот момент.
+    ///
+    /// Демон в ответ ничего не пишет в журнал: строка запроса и так видна в
+    /// отладочном выводе IPC, а вот ответ туда попасть не должен.
+    RevealSubscription {
+        id: SubscriptionId,
+    },
+    /// Удалить все подписки и все серверы.
     ClearSubscription,
-    RefreshSubscription,
+    RefreshSubscription {
+        /// `None` — перечитать все.
+        #[serde(default)]
+        id: Option<SubscriptionId>,
+    },
     ListServers,
     ProbeServers {
         /// `None` — замерить все.
         #[serde(default)]
         servers: Option<Vec<ProfileId>>,
     },
+    /// Настройки прокси в системе прописаны — можно доводить дело до конца.
+    ///
+    /// Шлёт тот, кто их прописал: агент в сеансе пользователя или CLI. Демон в
+    /// ответ обрывает установленные соединения, чтобы приложения переоткрыли
+    /// их уже через прокси.
+    ///
+    /// Отдельный запрос, а не действие по факту подключения, потому что
+    /// момент важен: оборви соединения раньше, чем адрес объявлен, — и
+    /// приложения переподключатся мимо прокси, то есть ровно туда, откуда мы
+    /// их уводим. Знать этот момент может только тот, кто объявляет.
+    ProxyAnnounced,
     GetSettings,
     PatchSettings {
         #[serde(flatten)]
@@ -108,6 +145,12 @@ pub enum Response {
     Accepted,
     Status(StatusSnapshot),
     Servers(Vec<ServerView>),
+    Subscriptions(Vec<SubscriptionStatus>),
+    /// Ключ подписки в открытом виде — ответ на `RevealSubscription`.
+    ///
+    /// `Secret` печатает маску в `Debug`, поэтому случайная отладочная печать
+    /// ответа его не раскроет.
+    SubscriptionSecret(Secret),
     Settings(Settings),
     Logs(Vec<String>),
     DiagnosticsPath(String),
@@ -120,8 +163,15 @@ pub enum Response {
 pub struct StatusSnapshot {
     pub state: TunnelState,
     pub stats: Stats,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub subscription: Option<SubscriptionStatus>,
+    /// Все подписки пользователя.
+    ///
+    /// Список, а не одна: у одного провайдера может лежать сервер, а у
+    /// другого — резерв на случай, когда первый недоступен целиком. Ради
+    /// этого случая режим и существует, и заставлять пользователя вручную
+    /// переставлять ключ в такой момент — ровно тогда, когда у него нет
+    /// интернета, — бессмысленно.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub subscriptions: Vec<SubscriptionStatus>,
     /// Сколько серверов сейчас известно.
     pub server_count: u32,
     /// Адреса локальных прокси, пока соединение поднято.
@@ -165,6 +215,11 @@ pub struct ServerView {
     pub host: String,
     pub port: u16,
     pub transport: TransportKind,
+    /// Из какой подписки пришёл сервер.
+    ///
+    /// С одной подпиской поле было бы лишним, с несколькими — необходимым:
+    /// иначе в общем списке не видно, чей сервер лёг и какую подписку менять.
+    pub subscription: SubscriptionId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub probe: Option<ProbeResult>,
     pub favorite: bool,
@@ -180,6 +235,7 @@ impl ServerView {
             host: profile.endpoint.host.clone(),
             port: profile.endpoint.port,
             transport: profile.transport.kind(),
+            subscription: profile.source.clone(),
             probe,
             favorite,
         }
@@ -207,9 +263,38 @@ pub enum Event {
     ServerListUpdated { count: u32 },
     SubscriptionUpdated(SubscriptionStatus),
     Probe(ProbeResult),
+    /// Сервер, на котором держалось соединение, перестал работать.
+    ///
+    /// Отдельное событие, а не оттенок `StateChanged`. Смена состояния
+    /// отвечает на вопрос «подключены ли мы», и на неё подписан тот, кому
+    /// нужно нарисовать иконку. А здесь другой факт: конкретный сервер
+    /// выбыл, и демон уходит на другой. Его хочет знать тот, кто ведёт учёт
+    /// качества серверов и объясняет пользователю, почему адрес сменился, —
+    /// из «reconnecting» этого не восстановить.
+    ServerFailed(ServerFailure),
     /// Ошибка, не привязанная к конкретному запросу.
     Error(IpcError),
     Log { line: String },
+}
+
+/// Подробности выбывания сервера.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerFailure {
+    /// Кто выбыл.
+    pub server: ProfileId,
+    /// Имя на момент падения: сервер может исчезнуть из подписки раньше, чем
+    /// пользователь посмотрит на журнал, и тогда по одному id ничего не понять.
+    pub name: String,
+    pub cause: ReconnectCause,
+    /// На кого демон переключается. `None` — заменить некем.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switching_to: Option<ProfileId>,
+    /// Задержка до нового сервера на последнем замере, мс.
+    ///
+    /// То самое основание, по которому он выбран. Без него сообщение «перешёл
+    /// на другой сервер» ничего не объясняет.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switching_to_rtt_ms: Option<u32>,
 }
 
 // ───────────────────────────── ошибки ─────────────────────────────

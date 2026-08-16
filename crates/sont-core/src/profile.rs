@@ -51,6 +51,14 @@ impl SubscriptionId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Собирает id из готовой строки.
+    ///
+    /// Нужно клиентам: пользователь называет подписку тем идентификатором,
+    /// который видел в списке, а исходного URL у клиента нет и быть не должно.
+    pub fn from_raw(raw: impl Into<String>) -> Self {
+        Self(raw.into())
+    }
 }
 
 impl fmt::Display for SubscriptionId {
@@ -258,6 +266,7 @@ mod tests {
             Transport::Shadowsocks(Shadowsocks {
                 method: "aes-256-gcm".into(),
                 password: Secret::new("x"),
+                plugin: None,
             }),
             sub(),
         );

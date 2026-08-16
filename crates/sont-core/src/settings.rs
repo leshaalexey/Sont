@@ -156,6 +156,27 @@ pub struct Settings {
     pub tray_autostart: bool,
     /// Выбирать сервер автоматически по замерам задержки.
     pub auto_select_server: bool,
+    /// Как часто перемеряется задержка до серверов, секунды.
+    ///
+    /// Замер нужен не сам по себе, а чтобы было на чём основать выбор в момент
+    /// падения текущего сервера. Мерить тогда уже поздно: пользователь сидит
+    /// без сети и ждёт.
+    pub probe_interval_secs: u32,
+    /// Переходить на сервер, который заметно быстрее текущего.
+    ///
+    /// Отдельно от `auto_select_server`: тот отвечает на вопрос «с чего
+    /// начать», а этот — «менять ли на ходу». Смена сервера рвёт все
+    /// соединения, поэтому по умолчанию выключено: делать это без спроса
+    /// из-за десятка миллисекунд значит мешать, а не помогать.
+    pub auto_switch: bool,
+    /// Насколько новый сервер должен быть быстрее, чтобы ради него рвать
+    /// соединение, миллисекунды.
+    pub switch_threshold_ms: u32,
+    /// Сколько раз демон бьётся в тот же сервер, прежде чем взять другой.
+    ///
+    /// Считается только для причин, не связанных с самим сервером: упавший
+    /// сервер меняется сразу.
+    pub reconnect_attempts: u32,
     /// Закреплённый пользователем сервер (используется, если автовыбор выключен).
     pub pinned_server: Option<crate::profile::ProfileId>,
     pub firewall: FirewallMode,
@@ -171,15 +192,41 @@ pub struct Settings {
     pub log_level: String,
     /// Язык интерфейса, BCP-47.
     pub language: String,
+    /// Красить акцентные элементы окна цветом системы.
+    ///
+    /// Живёт вместе с прочими настройками, хотя касается только окна: своего
+    /// состояния у окна нет, оно спрашивает демон и рисует ответ. Отдельный
+    /// файл настроек трея завёл бы вторую истину, расходящуюся с первой при
+    /// первой же команде из CLI.
+    pub system_accent: bool,
 }
 
 impl Default for Settings {
     fn default() -> Self {
         Self {
             mode: ConnectionMode::default(),
-            auto_connect: false,
+            // Включено по умолчанию.
+            //
+            // Выключенное автоподключение означает VPN, которому при каждом
+            // входе в систему нужно напоминать, зачем он установлен. Причём
+            // напоминание требуется ровно в тот момент, когда о нём проще
+            // всего забыть, — а забытый VPN не защищает.
+            //
+            // Настройка на виду и снимается одним переключателем, так что
+            // выбор у пользователя остаётся; меняется лишь то, какое
+            // поведение он получает, ничего не настраивая.
+            auto_connect: true,
             tray_autostart: true,
             auto_select_server: true,
+            // Пять минут: TCP-соединение к каждому серверу подписки стоит
+            // недорого, а замер недельной давности — это выбор наугад.
+            probe_interval_secs: 300,
+            auto_switch: false,
+            // Тридцать миллисекунд — граница, за которой разница заметна в
+            // работе. Меньше — это шум замера, ради которого рвать соединения
+            // не стоит.
+            switch_threshold_ms: 30,
+            reconnect_attempts: 3,
             pinned_server: None,
             firewall: FirewallMode::default(),
             dns: DnsSettings::default(),
@@ -189,6 +236,9 @@ impl Default for Settings {
             subscription_refresh_hours: 12,
             log_level: "info".to_owned(),
             language: "ru".to_owned(),
+            // По умолчанию окно держит собственный цвет: менять облик
+            // приложения без спроса — не то, чего ждут от установки.
+            system_accent: false,
         }
     }
 }
@@ -205,6 +255,10 @@ pub struct SettingsPatch {
     pub auto_connect: Option<bool>,
     pub tray_autostart: Option<bool>,
     pub auto_select_server: Option<bool>,
+    pub probe_interval_secs: Option<u32>,
+    pub auto_switch: Option<bool>,
+    pub switch_threshold_ms: Option<u32>,
+    pub reconnect_attempts: Option<u32>,
     /// `Some(None)` снимает закрепление, `None` оставляет как было.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pinned_server: Option<Option<crate::profile::ProfileId>>,
@@ -216,6 +270,7 @@ pub struct SettingsPatch {
     pub subscription_refresh_hours: Option<u32>,
     pub log_level: Option<String>,
     pub language: Option<String>,
+    pub system_accent: Option<bool>,
 }
 
 impl SettingsPatch {
@@ -242,6 +297,25 @@ impl SettingsPatch {
         if let Some(v) = self.auto_select_server {
             outcome.needs_core_restart |= settings.auto_select_server != v;
             settings.auto_select_server = v;
+        }
+        // Дальше — настройки надзора. Конфигурации ядра они не касаются:
+        // меняется только то, как демон решает, куда подключаться, а решение
+        // применяется следующим подключением.
+        if let Some(v) = self.probe_interval_secs {
+            // Ноль остановил бы замеры совсем, а слишком частый опрос
+            // превращается в постоянный стук во все серверы подписки.
+            settings.probe_interval_secs = v.clamp(15, 3600);
+        }
+        if let Some(v) = self.auto_switch {
+            settings.auto_switch = v;
+        }
+        if let Some(v) = self.switch_threshold_ms {
+            // Нулевой порог означал бы переподключение на каждом дрожании
+            // замера — это не «лучший сервер», а разрыв соединений без повода.
+            settings.switch_threshold_ms = v.max(1);
+        }
+        if let Some(v) = self.reconnect_attempts {
+            settings.reconnect_attempts = v.clamp(1, 9);
         }
         if let Some(v) = self.pinned_server {
             settings.pinned_server = v;
@@ -281,6 +355,9 @@ impl SettingsPatch {
         }
         if let Some(v) = self.language {
             settings.language = v;
+        }
+        if let Some(v) = self.system_accent {
+            settings.system_accent = v;
         }
 
         outcome
@@ -322,6 +399,65 @@ mod tests {
         assert_eq!(s.language, "en");
         assert!(!outcome.needs_core_restart);
         assert!(!outcome.needs_firewall_reapply);
+    }
+
+    #[test]
+    fn conductor_settings_are_kept_within_reason() {
+        // Значения приходят из интерфейса, а интерфейс когда-нибудь перепишут.
+        // Ноль в интервале замеров остановил бы их совсем, нулевой порог
+        // превратил бы переключение в непрерывный разрыв соединений, а ноль
+        // попыток — в отказ от восстановления.
+        let mut s = Settings::default();
+        SettingsPatch {
+            probe_interval_secs: Some(0),
+            switch_threshold_ms: Some(0),
+            reconnect_attempts: Some(0),
+            ..Default::default()
+        }
+        .apply(&mut s);
+
+        assert!(s.probe_interval_secs >= 15);
+        assert!(s.switch_threshold_ms >= 1);
+        assert!(s.reconnect_attempts >= 1);
+
+        // Сверху тоже: замер раз в сутки — это отсутствие замера, а девять
+        // попыток и так предел, заданный интерфейсом.
+        SettingsPatch {
+            probe_interval_secs: Some(u32::MAX),
+            reconnect_attempts: Some(u32::MAX),
+            ..Default::default()
+        }
+        .apply(&mut s);
+
+        assert!(s.probe_interval_secs <= 3600);
+        assert!(s.reconnect_attempts <= 9);
+    }
+
+    #[test]
+    fn conductor_settings_do_not_restart_the_core() {
+        // Они меняют не конфигурацию ядра, а решения демона о том, куда
+        // подключаться. Перезапуск ради них рвал бы соединение впустую.
+        let mut s = Settings::default();
+        let outcome = SettingsPatch {
+            probe_interval_secs: Some(60),
+            auto_switch: Some(true),
+            switch_threshold_ms: Some(50),
+            reconnect_attempts: Some(5),
+            ..Default::default()
+        }
+        .apply(&mut s);
+
+        assert_eq!(s.probe_interval_secs, 60);
+        assert!(s.auto_switch);
+        assert_eq!(s.switch_threshold_ms, 50);
+        assert_eq!(s.reconnect_attempts, 5);
+        assert!(!outcome.needs_core_restart);
+    }
+
+    #[test]
+    fn switching_servers_is_off_by_default() {
+        // Демон не рвёт соединения по своей инициативе, пока его не попросят.
+        assert!(!Settings::default().auto_switch);
     }
 
     #[test]

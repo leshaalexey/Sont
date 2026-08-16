@@ -61,7 +61,14 @@ pub async fn run() -> Result<()> {
 
 async fn serve() -> Result<()> {
     let addr = sont_ipc::endpoint_name();
-    let mut applied = Desired::None;
+
+    // Не `Desired::None`, а «неизвестно».
+    //
+    // Разница в том, что происходит после аварийного завершения прежнего
+    // агента: настройки от него остались в системе, а новый, считая, что
+    // ничего не применено, увидел бы совпадение с желаемым «ничего» и не стал
+    // бы их снимать. Пользователь остался бы с прокси, за которым никого нет.
+    let mut applied: Option<Desired> = None;
 
     loop {
         let connected = Client::connect(&addr, AGENT).await;
@@ -70,10 +77,10 @@ async fn serve() -> Result<()> {
             Ok(v) => v,
             Err(e) => {
                 // Демона нет — значит и прокси быть не должно.
-                if applied != Desired::None {
+                if applied != Some(Desired::None) {
                     tracing::info!("демон недоступен, снимаю настройки прокси");
-                    applied = Desired::None;
-                    apply(&applied);
+                    apply(&Desired::None);
+                    applied = Some(Desired::None);
                 }
                 tracing::debug!(error = %e, "демон недоступен, повтор");
                 tokio::time::sleep(RECONNECT_DELAY).await;
@@ -105,7 +112,7 @@ async fn serve() -> Result<()> {
 }
 
 /// Приводит настройки системы в соответствие с состоянием демона.
-async fn sync(client: &Client, applied: &mut Desired) {
+async fn sync(client: &Client, applied: &mut Option<Desired>) {
     let desired = match desired_state(client).await {
         Some(d) => d,
         // Демон не ответил: не трогаем настройки, иначе рискуем снять рабочий
@@ -113,12 +120,30 @@ async fn sync(client: &Client, applied: &mut Desired) {
         None => return,
     };
 
-    if desired == *applied {
+    if !needs_apply(applied.as_ref(), &desired) {
         return;
     }
 
-    apply(&desired);
-    *applied = desired;
+    let announced = apply(&desired);
+    *applied = Some(desired);
+
+    // Сообщаем демону, что адрес объявлен. Дальше его дело: он оборвёт
+    // установленные соединения, чтобы приложения переоткрыли их уже через
+    // прокси. Порядок здесь и есть весь смысл — оборви их раньше объявления,
+    // и приложения переподключатся мимо.
+    if announced {
+        let _ = client.request(Request::ProxyAnnounced).await;
+    }
+}
+
+/// Нужно ли трогать настройки системы.
+///
+/// `None` слева — «неизвестно, что сейчас применено»: так агент выглядит сразу
+/// после запуска. В этом случае применяем всегда, даже желаемое «ничего»: в
+/// системе могли остаться настройки от прежнего экземпляра, завершившегося
+/// аварийно.
+fn needs_apply(applied: Option<&Desired>, desired: &Desired) -> bool {
+    applied != Some(desired)
 }
 
 async fn desired_state(client: &Client) -> Option<Desired> {
@@ -136,15 +161,13 @@ async fn desired_state(client: &Client) -> Option<Desired> {
     };
 
     Some(match status.proxy {
-        Some(p) => Desired::Proxy(sysproxy::Endpoints {
-            http: p.http,
-            socks: p.socks,
-        }),
+        Some(p) => Desired::Proxy(sysproxy::Endpoints { http: p.http }),
         None => Desired::None,
     })
 }
 
-fn apply(desired: &Desired) {
+/// Применяет состояние. Возвращает, оказался ли прокси объявлен.
+fn apply(desired: &Desired) -> bool {
     let outcome = match desired {
         Desired::Proxy(endpoints) => {
             tracing::info!(http = %endpoints.http, "включаю системный прокси");
@@ -158,7 +181,10 @@ fn apply(desired: &Desired) {
 
     if let Err(e) = outcome {
         tracing::error!(error = %e, "не удалось изменить настройки прокси");
+        return false;
     }
+
+    matches!(desired, Desired::Proxy(_))
 }
 
 // ───────────────────────────── автозапуск ─────────────────────────────
@@ -304,7 +330,6 @@ mod tests {
     fn endpoints() -> sysproxy::Endpoints {
         sysproxy::Endpoints {
             http: "127.0.0.1:18966".to_owned(),
-            socks: "127.0.0.1:18965".to_owned(),
         }
     }
 
@@ -322,7 +347,6 @@ mod tests {
         let a = Desired::Proxy(endpoints());
         let b = Desired::Proxy(sysproxy::Endpoints {
             http: "127.0.0.1:19000".to_owned(),
-            socks: "127.0.0.1:18965".to_owned(),
         });
         assert_ne!(a, b);
     }
@@ -330,6 +354,26 @@ mod tests {
     #[test]
     fn disconnected_state_differs_from_proxy() {
         assert_ne!(Desired::Proxy(endpoints()), Desired::None);
+    }
+
+    #[test]
+    fn first_sync_applies_even_when_nothing_is_wanted() {
+        // Прежний агент мог завершиться аварийно, оставив прокси в системе.
+        // Новый про это ничего не знает и обязан привести настройки в порядок,
+        // а не решить, что «ничего» и так совпадает с «ничего».
+        assert!(needs_apply(None, &Desired::None));
+        assert!(needs_apply(None, &Desired::Proxy(endpoints())));
+    }
+
+    #[test]
+    fn unchanged_state_is_not_reapplied() {
+        // Переприменение дёргает всю систему: сообщение о смене настроек
+        // рассылается всем окнам сеанса.
+        assert!(!needs_apply(Some(&Desired::None), &Desired::None));
+        assert!(!needs_apply(
+            Some(&Desired::Proxy(endpoints())),
+            &Desired::Proxy(endpoints())
+        ));
     }
 
     #[test]

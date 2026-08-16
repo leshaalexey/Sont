@@ -6,6 +6,20 @@ members = [
     "crates/sont-sub",
     "crates/sont-xray",
     "crates/sont-daemon",
+    "crates/sont-tray",
+]
+
+# Трей намеренно вне набора по умолчанию.
+#
+# Он тянет Tauri, а это несколько сотен зависимостей и минуты сборки. Обычный
+# цикл разработки демона — `cargo test` и `cargo clippy` — не должен из-за
+# этого замедляться в разы. Собирать трей: `cargo build -p sont-tray`.
+default-members = [
+    "crates/sont-core",
+    "crates/sont-ipc",
+    "crates/sont-sub",
+    "crates/sont-xray",
+    "crates/sont-daemon",
 ]
 
 [workspace.package]

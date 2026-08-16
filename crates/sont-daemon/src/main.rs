@@ -5,10 +5,13 @@
 //! посмотреть состояние и сбросить правила firewall, не имея под рукой GUI.
 
 mod agent;
+mod connections;
 mod core;
 mod demo;
+mod firewall;
 mod logging;
 mod paths;
+mod probe;
 mod secrets;
 #[cfg(windows)]
 mod service;
@@ -17,6 +20,7 @@ mod subscription;
 mod supervisor;
 mod sysproxy;
 mod tunnel;
+mod winhttp;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -72,6 +76,12 @@ enum Cmd {
 
     /// Показать список серверов.
     Servers,
+
+    /// Замерить задержку до всех серверов.
+    ///
+    /// По этим числам демон выбирает сервер при подключении и подбирает
+    /// замену, когда текущий выбывает.
+    Probe,
 
     /// Показать или сменить режим работы.
     Mode {
@@ -146,6 +156,9 @@ enum ServiceAction {
     Stop,
     /// Показать состояние службы.
     Status,
+    /// Установить (или починить) и запустить одним вызовом. Нужны права
+    /// администратора. Это то, что делает трей при запуске.
+    Setup,
     /// Точка входа для диспетчера служб. Вручную не вызывается.
     #[command(hide = true)]
     Run,
@@ -165,19 +178,31 @@ enum AgentAction {
 
 #[derive(Subcommand)]
 enum SubscriptionAction {
-    /// Задать ключ подписки и сразу прочитать её.
+    /// Добавить подписку и сразу прочитать её.
     ///
     /// Ключ сохраняется в зашифрованном виде и в выводе не показывается.
-    Set {
+    /// Подписок может быть несколько: серверы из них складываются в общий
+    /// список, и при падении сервера демон переходит на лучший из всех.
+    Add {
         /// Ссылка подписки. Если не указана — будет запрошена из stdin,
         /// чтобы ключ не попал в историю команд оболочки.
         url: Option<String>,
     },
-    /// Показать состояние подписки.
+    /// Показать все подписки.
+    List,
+    /// Показать состояние подписок.
     Show,
-    /// Перечитать подписку с панели.
-    Refresh,
-    /// Удалить ключ и все связанные с ним серверы.
+    /// Удалить одну подписку и пришедшие из неё серверы.
+    Remove {
+        /// Идентификатор из `sontd subscription list`.
+        id: String,
+    },
+    /// Перечитать подписки с панелей.
+    Refresh {
+        /// Идентификатор из `sontd subscription list`. Без него — все.
+        id: Option<String>,
+    },
+    /// Удалить все подписки и все серверы.
     Clear,
 }
 
@@ -234,6 +259,7 @@ fn main() -> Result<()> {
             Cmd::Status => status().await,
             Cmd::Subscription { action } => subscription_cmd(action).await,
             Cmd::Servers => servers().await,
+            Cmd::Probe => probe_cmd().await,
             Cmd::Mode { value } => mode(value).await,
             Cmd::Autoconnect { value } => autoconnect(value).await,
             Cmd::Check => check().await,
@@ -268,6 +294,11 @@ fn service_cmd(action: ServiceAction) -> Result<()> {
         ServiceAction::Start => {
             service::start()?;
             println!("Служба запущена.");
+            Ok(())
+        }
+        ServiceAction::Setup => {
+            service::setup()?;
+            println!("Служба установлена и работает.");
             Ok(())
         }
         ServiceAction::Stop => {
@@ -374,8 +405,9 @@ async fn run_daemon(options: DaemonOptions, stop: impl std::future::Future<Outpu
             demo_servers,
             settings_path: paths::settings_file(),
             favorites_path: paths::favorites_file(),
-            subscription_path: paths::subscription_file(),
-            servers_cache_path: paths::servers_cache_file(),
+            subscriptions_path: paths::subscriptions_file(),
+            legacy_subscription_path: paths::legacy_subscription_file(),
+            legacy_servers_cache_path: paths::legacy_servers_cache_file(),
             core_binary: paths::core_binary(),
             core_config_path: paths::core_config(),
         },
@@ -435,9 +467,15 @@ async fn status() -> Result<()> {
     println!("Состояние:   {}", status.state.kind());
     println!("Блокировка:  {}", if status.state.is_blocked() { "да" } else { "нет" });
     println!("Серверов:    {}", status.server_count);
-    match &status.subscription {
-        Some(s) => println!("Подписка:    {}", s.masked_url),
-        None => println!("Подписка:    не задана"),
+    match status.subscriptions.len() {
+        0 => println!("Подписки:    нет"),
+        1 => println!("Подписка:    {}", status.subscriptions[0].masked_url),
+        n => {
+            println!("Подписок:    {n}");
+            for sub in &status.subscriptions {
+                println!("             {}", sub.masked_url);
+            }
+        }
     }
 
     if let Response::DaemonInfo(info) = client.request(Request::DaemonInfo).await? {
@@ -451,19 +489,65 @@ async fn status() -> Result<()> {
 
 async fn subscription_cmd(action: SubscriptionAction) -> Result<()> {
     match action {
-        SubscriptionAction::Set { url } => subscription_set(url).await,
+        SubscriptionAction::Add { url } => subscription_add(url).await,
+        SubscriptionAction::List => subscription_list().await,
         SubscriptionAction::Show => subscription_show().await,
-        SubscriptionAction::Refresh => subscription_refresh().await,
+        SubscriptionAction::Remove { id } => subscription_remove(id).await,
+        SubscriptionAction::Refresh { id } => subscription_refresh(id).await,
         SubscriptionAction::Clear => {
             let (client, _events) = client().await;
             client.request(Request::ClearSubscription).await?;
-            println!("Подписка удалена.");
+            println!("Все подписки удалены.");
             Ok(())
         }
     }
 }
 
-async fn subscription_set(url: Option<String>) -> Result<()> {
+async fn subscription_list() -> Result<()> {
+    let (client, _events) = client().await;
+    let Response::Subscriptions(subs) = client.request(Request::ListSubscriptions).await? else {
+        anyhow::bail!("неожиданный ответ демона");
+    };
+
+    if subs.is_empty() {
+        println!("Подписок нет. Добавьте: sontd subscription add");
+        return Ok(());
+    }
+
+    println!("{:<18} {:<9} ССЫЛКА", "ИДЕНТИФИКАТОР", "СЕРВЕРОВ");
+    for sub in &subs {
+        println!(
+            "{:<18} {:<9} {}",
+            sub.id.as_str(),
+            sub.info.server_count,
+            sub.masked_url
+        );
+    }
+    Ok(())
+}
+
+async fn subscription_remove(id: String) -> Result<()> {
+    let (client, _events) = client().await;
+    let response = client
+        .request(Request::RemoveSubscription {
+            id: sont_core::SubscriptionId::from_raw(id),
+        })
+        .await?;
+
+    match response {
+        Response::Error(e) => {
+            eprintln!("Не удалось удалить: {e}");
+            eprintln!("Список подписок: sontd subscription list");
+            std::process::exit(1);
+        }
+        _ => {
+            println!("Подписка удалена вместе с её серверами.");
+            Ok(())
+        }
+    }
+}
+
+async fn subscription_add(url: Option<String>) -> Result<()> {
     let url = match url {
         Some(u) => u,
         None => {
@@ -487,7 +571,7 @@ async fn subscription_set(url: Option<String>) -> Result<()> {
     let (client, events) = client().await;
     client.request(Request::SubscribeEvents).await?;
     client
-        .request(Request::SetSubscription {
+        .request(Request::AddSubscription {
             url: sont_core::Secret::new(url),
         })
         .await?;
@@ -496,12 +580,21 @@ async fn subscription_set(url: Option<String>) -> Result<()> {
     await_subscription(events).await
 }
 
-async fn subscription_refresh() -> Result<()> {
+async fn subscription_refresh(id: Option<String>) -> Result<()> {
     let (client, events) = client().await;
     client.request(Request::SubscribeEvents).await?;
-    client.request(Request::RefreshSubscription).await?;
+    let response = client
+        .request(Request::RefreshSubscription {
+            id: id.map(sont_core::SubscriptionId::from_raw),
+        })
+        .await?;
 
-    println!("Обновляю подписку…");
+    if let Response::Error(e) = response {
+        eprintln!("Не удалось обновить: {e}");
+        std::process::exit(1);
+    }
+
+    println!("Обновляю подписки…");
     await_subscription(events).await
 }
 
@@ -566,29 +659,37 @@ async fn subscription_show() -> Result<()> {
         anyhow::bail!("неожиданный ответ демона");
     };
 
-    let Some(sub) = status.subscription else {
-        println!("Подписка не задана. Задайте её: sontd subscription set");
+    if status.subscriptions.is_empty() {
+        println!("Подписок нет. Добавьте: sontd subscription add");
         return Ok(());
-    };
-
-    println!("Подписка: {}", sub.masked_url);
-    println!("Серверов: {}", status.server_count);
-
-    match sub.info.fetched_at_unix {
-        Some(t) => println!("Обновлена: {}", format_unix_date(t)),
-        None => println!("Обновлена: ещё не читалась"),
     }
-    match sub.info.expires_at_unix {
-        Some(exp) => println!("Истекает:  {}", format_unix_date(exp)),
-        None => println!("Истекает:  бессрочно"),
-    }
-    if let Some(percent) = sub.info.used_percent() {
-        let used = sub.info.upload.unwrap_or(0) + sub.info.download.unwrap_or(0);
-        println!(
-            "Трафик:    {} из {} ({percent}%)",
-            human_bytes(used),
-            human_bytes(sub.info.total.unwrap_or(0))
-        );
+
+    println!("Серверов всего: {}\n", status.server_count);
+
+    for (i, sub) in status.subscriptions.iter().enumerate() {
+        if i > 0 {
+            println!();
+        }
+        println!("Подписка:  {}", sub.masked_url);
+        println!("Идентификатор: {}", sub.id.as_str());
+        println!("Серверов:  {}", sub.info.server_count);
+
+        match sub.info.fetched_at_unix {
+            Some(t) => println!("Обновлена: {}", format_unix_date(t)),
+            None => println!("Обновлена: ещё не читалась"),
+        }
+        match sub.info.expires_at_unix {
+            Some(exp) => println!("Истекает:  {}", format_unix_date(exp)),
+            None => println!("Истекает:  бессрочно"),
+        }
+        if let Some(percent) = sub.info.used_percent() {
+            let used = sub.info.upload.unwrap_or(0) + sub.info.download.unwrap_or(0);
+            println!(
+                "Трафик:    {} из {} ({percent}%)",
+                human_bytes(used),
+                human_bytes(sub.info.total.unwrap_or(0))
+            );
+        }
     }
 
     Ok(())
@@ -757,6 +858,35 @@ async fn check() -> Result<()> {
     show("напрямую, мимо всех настроек", &direct_ip);
     println!();
 
+    // Где именно объявлен прокси.
+    //
+    // Разных мест три, и читают их разные семейства программ. Пока не видно,
+    // какое из них пустует, «у меня не работает» остаётся неразрешимым: одно
+    // и то же наблюдение получается и когда приложение не читает настройку, и
+    // когда настройки просто нет.
+    if matches!(settings.mode, ConnectionMode::Proxy) {
+        let expected = status.proxy.as_ref().map(|p| p.http.clone());
+        println!("Где объявлен прокси (в режиме прокси нужны все три):\n");
+        report_channel(
+            "настройки Windows (браузеры, Electron)",
+            system.as_ref().and_then(|(on, value)| {
+                on.then(|| sysproxy::http_endpoint_of(value)).flatten()
+            }),
+            &expected,
+        );
+        report_channel(
+            "HTTPS_PROXY (Node, Python, Go, curl)",
+            user_env_proxy(),
+            &expected,
+        );
+        report_channel(
+            "машинная WinHTTP (службы)",
+            machine_proxy_setting(),
+            &expected,
+        );
+        println!();
+    }
+
     let tunnelled = proxy_ip.as_ref().or(system_ip.as_ref());
     let Some(tunnelled) = tunnelled else {
         println!("Через туннель ответа нет — соединение не работает, несмотря на состояние.");
@@ -797,31 +927,220 @@ async fn servers() -> Result<()> {
     };
 
     if servers.is_empty() {
-        println!("Серверов нет. Задайте подписку: sontd subscription set");
+        println!("Серверов нет. Добавьте подписку: sontd subscription add");
         return Ok(());
     }
 
-    println!(
-        "{:<18} {:<28} {:<14} {:>8}  {}",
-        "ID", "ИМЯ", "ПРОТОКОЛ", "ПИНГ", "АДРЕС"
-    );
+    // Столбец подписки показываем только когда их несколько: с одной он
+    // повторял бы одно и то же значение во всех строках.
+    let sources: std::collections::HashSet<_> =
+        servers.iter().map(|s| s.subscription.as_str()).collect();
+    let show_source = sources.len() > 1;
+
+    if show_source {
+        println!(
+            "{:<18} {:<28} {:<14} {:>8}  {:<18} АДРЕС",
+            "ID", "ИМЯ", "ПРОТОКОЛ", "ПИНГ", "ПОДПИСКА"
+        );
+    } else {
+        println!(
+            "{:<18} {:<28} {:<14} {:>8}  АДРЕС",
+            "ID", "ИМЯ", "ПРОТОКОЛ", "ПИНГ"
+        );
+    }
+
     for s in &servers {
-        let rtt = match s.probe.as_ref().and_then(|p| p.rtt_ms) {
-            Some(ms) => format!("{ms} мс"),
+        let rtt = match s.probe.as_ref() {
+            Some(p) if p.loss_percent > 0 && p.rtt_ms.is_some() => {
+                // Потери важнее самой задержки: на них соединение
+                // пробуксовывает так, что лишние миллисекунды уже не главное.
+                format!("{} мс {}%", p.rtt_ms.unwrap(), p.loss_percent)
+            }
+            Some(p) => match p.rtt_ms {
+                Some(ms) => format!("{ms} мс"),
+                None => "не отв.".to_owned(),
+            },
             None => "—".to_owned(),
         };
         let mark = if s.favorite { "★ " } else { "  " };
-        println!(
-            "{:<18} {mark}{:<26} {:<14} {:>8}  {}:{}",
-            s.id.as_str(),
-            truncate(&s.name, 26),
-            s.transport.as_str(),
-            rtt,
-            s.host,
-            s.port
-        );
+
+        if show_source {
+            println!(
+                "{:<18} {mark}{:<26} {:<14} {:>8}  {:<18} {}:{}",
+                s.id.as_str(),
+                truncate(&s.name, 26),
+                s.transport.as_str(),
+                rtt,
+                s.subscription.as_str(),
+                s.host,
+                s.port
+            );
+        } else {
+            println!(
+                "{:<18} {mark}{:<26} {:<14} {:>8}  {}:{}",
+                s.id.as_str(),
+                truncate(&s.name, 26),
+                s.transport.as_str(),
+                rtt,
+                s.host,
+                s.port
+            );
+        }
     }
     println!("\nВсего: {}", servers.len());
+    if servers.iter().all(|s| s.probe.is_none()) {
+        println!("Задержка ещё не измерена: sontd probe");
+    }
+
+    Ok(())
+}
+
+/// Печатает состояние одной точки объявления прокси.
+///
+/// Сравнение с ожидаемым адресом, а не просто «задано/не задано»: настройка,
+/// указывающая на чужой или устаревший порт, для пользователя выглядит ровно
+/// так же, как отсутствующая, а чинится совсем иначе.
+fn report_channel(label: &str, actual: Option<String>, expected: &Option<String>) {
+    let verdict = match (&actual, expected) {
+        (Some(a), Some(e)) if a == e => "да".to_owned(),
+        (Some(a), Some(_)) => format!("указывает на {a} — не наш адрес"),
+        (Some(a), None) => format!("задан {a}, но демон адреса не сообщил"),
+        (None, _) => "нет".to_owned(),
+    };
+    println!("  {label:<38} {verdict}");
+}
+
+/// Значение `HTTPS_PROXY` в профиле пользователя.
+///
+/// Читаем из реестра, а не из своего окружения: своё мы получили при запуске,
+/// и свежую правку оно не покажет — ровно та причина, по которой уже открытым
+/// приложениям нужен перезапуск.
+#[cfg(windows)]
+fn user_env_proxy() -> Option<String> {
+    let output = std::process::Command::new("reg")
+        .args([
+            "query",
+            r"HKCU\Environment",
+            "/v",
+            "HTTPS_PROXY",
+        ])
+        .output()
+        .ok()?;
+
+    let text = String::from_utf8_lossy(&output.stdout);
+    let value = text
+        .lines()
+        .find(|l| l.contains("HTTPS_PROXY"))?
+        .split_whitespace()
+        .next_back()?
+        .to_owned();
+
+    (!value.is_empty()).then_some(value)
+}
+
+#[cfg(not(windows))]
+fn user_env_proxy() -> Option<String> {
+    std::env::var("HTTPS_PROXY").ok().filter(|v| !v.is_empty())
+}
+
+/// Адрес из машинной настройки WinHTTP.
+#[cfg(windows)]
+fn machine_proxy_setting() -> Option<String> {
+    winhttp::ours_if_any()
+}
+
+#[cfg(not(windows))]
+fn machine_proxy_setting() -> Option<String> {
+    None
+}
+
+/// Человеческое описание выбывания сервера.
+fn describe_failure(f: &sont_ipc::ServerFailure) -> String {
+    use sont_core::ReconnectCause;
+
+    let why = match &f.cause {
+        ReconnectCause::CoreExited { .. } => "соединение с ним оборвалось",
+        ReconnectCause::HealthCheckFailed { .. } => "он перестал проводить трафик",
+        // Остальные причины сервером не вызваны и сюда не приводят, но
+        // молчать в ответ на неожиданное значение — худший вариант.
+        _ => "он выбыл",
+    };
+
+    match (&f.switching_to, f.switching_to_rtt_ms) {
+        (Some(_), Some(rtt)) => format!(
+            "{}: {why}, перехожу на другой сервер ({rtt} мс)",
+            truncate(&f.name, 28)
+        ),
+        (Some(_), None) => format!("{}: {why}, перехожу на другой сервер", truncate(&f.name, 28)),
+        (None, _) => format!("{}: {why}, заменить некем", truncate(&f.name, 28)),
+    }
+}
+
+/// Замер задержки до всех серверов.
+async fn probe_cmd() -> Result<()> {
+    use sont_ipc::Event;
+
+    let (client, mut events) = client().await;
+    client.request(Request::SubscribeEvents).await?;
+
+    let response = client.request(Request::ProbeServers { servers: None }).await?;
+    if let Response::Error(e) = response {
+        eprintln!("Замер невозможен: {e}");
+        std::process::exit(1);
+    }
+
+    let Response::Servers(known) = client.request(Request::ListServers).await? else {
+        anyhow::bail!("неожиданный ответ демона");
+    };
+    let total = known.len();
+    println!("Меряю задержку до {total} серверов…");
+
+    // Результаты приходят по одному, а не пачкой: демон меряет параллельно и
+    // публикует каждый по готовности. Ждём, пока придут все, но не бесконечно.
+    let mut measured = std::collections::HashMap::new();
+    let deadline = tokio::time::Duration::from_secs(60);
+    let _ = tokio::time::timeout(deadline, async {
+        while let Some(event) = events.recv().await {
+            if let Event::Probe(p) = event {
+                measured.insert(p.server.clone(), p);
+                if measured.len() >= total {
+                    return;
+                }
+            }
+        }
+    })
+    .await;
+
+    if measured.is_empty() {
+        anyhow::bail!("демон не сообщил ни одного результата");
+    }
+
+    let mut rows: Vec<_> = known
+        .iter()
+        .filter_map(|s| measured.get(&s.id).map(|p| (s, p)))
+        .collect();
+    // Порядок тот же, по которому демон выбирает сервер: сверху лучший.
+    rows.sort_by_key(|(_, p)| p.score());
+
+    println!("\n{:<28} {:>10}  ПОТЕРИ", "ИМЯ", "ПИНГ");
+    for (s, p) in &rows {
+        let rtt = match p.rtt_ms {
+            Some(ms) => format!("{ms} мс"),
+            None => "не отвечает".to_owned(),
+        };
+        println!(
+            "{:<28} {:>10}  {}%",
+            truncate(&s.name, 28),
+            rtt,
+            p.loss_percent
+        );
+    }
+
+    let reachable = rows.iter().filter(|(_, p)| p.is_reachable()).count();
+    println!("\nОтвечают: {reachable} из {}", rows.len());
+    if measured.len() < total {
+        println!("Часть серверов не успела ответить за отведённое время.");
+    }
 
     Ok(())
 }
@@ -851,6 +1170,10 @@ async fn connect(server: Option<String>) -> Result<()> {
                     }
                     other => println!("  {}", other.kind()),
                 },
+                // Смена сервера посреди подключения выглядела бы необъяснимо:
+                // пользователь просил один, подключился к другому. Говорим,
+                // что произошло и на каком основании выбрана замена.
+                Event::ServerFailed(f) => println!("  {}", describe_failure(&f)),
                 Event::Error(e) => return Some(Err(e.to_string())),
                 _ => {}
             }
@@ -885,7 +1208,8 @@ async fn disconnect() -> Result<()> {
         Ok(()) => println!("Отключено, системный прокси убран."),
         Err(e) => {
             eprintln!("Отключено, но не удалось убрать системный прокси: {e}");
-            eprintln!("Проверьте: Параметры → Сеть и Интернет → Прокси.");
+            eprintln!("Проверьте: Параметры → Сеть и Интернет → Прокси,");
+            eprintln!("а также переменные HTTP_PROXY, HTTPS_PROXY и NO_PROXY.");
         }
     }
     Ok(())
@@ -934,6 +1258,16 @@ async fn mode(value: Option<String>) -> Result<()> {
                 "Учтите: приложения, не читающие настройки прокси, пойдут напрямую, \n\
                  и QUIC в браузерах тоже идёт мимо."
             );
+
+            // Объявляем прокси сразу, не дожидаясь переподключения.
+            //
+            // Локальный HTTP-вход ядро поднимает в обоих режимах и на том же
+            // порту, так что объявленный сейчас адрес рабочий уже сейчас — и
+            // останется рабочим после переключения. Смысл в порядке: пока
+            // адрес не объявлен, а прежний путь при подключении уже снят,
+            // приложения успевают уйти напрямую и остаются так, потому что
+            // открытые соединения на появившийся прокси не переносятся.
+            apply_system_proxy_if_needed(&client).await;
         }
     }
     println!("Изменение вступит в силу при следующем подключении.");
@@ -964,13 +1298,36 @@ async fn apply_system_proxy_if_needed(client: &Client) {
 
     let endpoints = sysproxy::Endpoints {
         http: proxy.http.clone(),
-        socks: proxy.socks.clone(),
     };
 
     match sysproxy::apply(&endpoints) {
         Ok(()) => {
-            println!("Системный прокси включён: HTTP {} / SOCKS {}", proxy.http, proxy.socks);
-            println!("Приложения, не читающие настройки прокси, идут напрямую.");
+            // Демон дожидается этого сообщения, чтобы оборвать установленные
+            // соединения: настройка действует только на новые, а открытые
+            // живут часами и продолжают ходить напрямую.
+            let _ = client.request(Request::ProxyAnnounced).await;
+
+            println!("Системный прокси включён: HTTP {}", proxy.http);
+            println!("Прописан и в настройки Windows, и в HTTP_PROXY/HTTPS_PROXY.");
+            // SOCKS в системные настройки не попадает намеренно (см. sysproxy),
+            // но он поднят, и приложению, которое настраивается вручную, он
+            // нужен — поэтому адрес показываем.
+            println!("SOCKS {} — для ручной настройки отдельных приложений.", proxy.socks);
+            println!();
+            // Переменные окружения процесс получает при запуске: уже открытым
+            // приложениям они не достанутся. Сказать об этом обязательно —
+            // иначе пользователь решит, что не подействовало вообще.
+            println!("Приложения, запущенные до этой команды, переменных не увидят —");
+            println!("их нужно перезапустить. Кто не читает ни то ни другое, идёт напрямую.");
+
+            // Настройки прокси живут ровно столько, сколько их кто-то
+            // поддерживает. Эта команда прописала их один раз; переподключение
+            // демона (упавшее ядро, смена сервера) её не повторит.
+            if !agent::is_installed() {
+                println!();
+                println!("Агент сеанса не установлен: после переподключения демона");
+                println!("настройки системы обновить будет некому. Установить: sontd agent install");
+            }
         }
         Err(e) => {
             eprintln!("Не удалось прописать прокси в настройки системы: {e}");
@@ -1033,7 +1390,13 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 async fn firewall_reset() -> Result<()> {
-    // Аварийный сброс обязан работать даже при мёртвом демоне, поэтому в
-    // фазе 4 он будет снимать фильтры напрямую, а не через IPC.
-    anyhow::bail!("сброс правил firewall появится вместе с kill-switch (фаза 4)")
+    // Напрямую, а не через IPC: аварийный сброс нужен ровно тогда, когда
+    // демон мёртв, а постоянные фильтры режима lockdown его пережили. Ходить
+    // за этим к демону значило бы требовать работоспособности от того, чья
+    // неработоспособность и есть причина обращения.
+    firewall::reset().context(
+        "не удалось снять фильтры; для этого нужны права администратора",
+    )?;
+    println!("Фильтры сняты, трафик идёт напрямую.");
+    Ok(())
 }

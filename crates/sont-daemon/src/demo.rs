@@ -54,6 +54,7 @@ pub fn servers() -> Vec<ServerProfile> {
             Transport::Shadowsocks(sont_core::transport::Shadowsocks {
                 method: "2022-blake3-aes-128-gcm".into(),
                 password: Secret::new("demo-password"),
+                plugin: None,
             }),
             source.clone(),
         ),

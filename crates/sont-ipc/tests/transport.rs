@@ -57,7 +57,7 @@ fn snapshot() -> StatusSnapshot {
     StatusSnapshot {
         state: TunnelState::default(),
         stats: Stats::default(),
-        subscription: None,
+        subscriptions: Vec::new(),
         server_count: 0,
         proxy: None,
     }

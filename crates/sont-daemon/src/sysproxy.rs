@@ -10,38 +10,138 @@
 //! Поэтому применяет настройки то, что работает в сеансе пользователя: сейчас
 //! CLI, в дальнейшем tray-приложение. Демон только сообщает адреса.
 //!
+//! # Три разных способа объявить прокси
+//!
+//! Настроек прокси в Windows не одна, а три, и читают их разные семейства
+//! приложений. Этот модуль отвечает за две пользовательские; третья, машинная,
+//! живёт в [`crate::winhttp`] — задать её может только демон.
+//!
+//! Ветка `Internet Settings` — родная для Windows. Её читают WinINET и
+//! Chromium, то есть браузеры и всё на Electron.
+//!
+//! Переменные окружения `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` — соглашение
+//! мира Unix, но именно его соблюдает всё, что принесено оттуда: Node, Python,
+//! Go, curl, git. Настроек Windows эти программы не читают вовсе, и в режиме
+//! прокси идут напрямую, ничего никому не сообщая.
+//!
+//! Пример того, как это выглядит у пользователя: Claude Desktop состоит из
+//! оболочки на Electron и отдельного процесса Claude Code на Node. Первая
+//! честно ходила через прокси, второй — мимо, и со стороны это выглядело как
+//! «приложение работает в обход VPN».
+//!
+//! Поэтому объявляем все три.
+//!
 //! # Что остаётся за пределами прокси
 //!
-//! Приложение, не читающее эти настройки, пойдёт напрямую — молча. Отдельно
-//! мимо идёт QUIC: системные настройки прокси на него не распространяются, а
-//! браузеры используют его постоянно. Это ограничение режима, а не дефект
-//! реализации, и пользователю о нём говорится прямо.
+//! Приложение, не читающее ни одну из трёх настроек, пойдёт напрямую — молча.
+//! Это предел режима, а не дефект реализации: заставить чужую программу ходить
+//! через прокси против её воли можно только фильтром на уровне сети, то есть
+//! режимом туннеля. Пользователю об этом говорится прямо.
+//!
+//! Про QUIC оговорка точнее, чем «идёт мимо». Настройки прокси действительно
+//! не распространяются на UDP, но браузер, который эти настройки прочитал, сам
+//! перестаёт использовать QUIC и переходит на TCP через прокси: замер показал
+//! обращения вида `CONNECT узел:443` к тем самым адресам, куда браузер до
+//! этого ходил по HTTP/3. Мимо QUIC идёт у приложений, которые настройку
+//! проигнорировали, — но у них мимо идёт и всё остальное.
+//!
+//! Переменные окружения достаются процессу при запуске, поэтому уже открытые
+//! приложения их не увидят: им нужен перезапуск. Об этом тоже говорится прямо —
+//! молчаливое «почему-то не подействовало» хуже честного «перезапустите».
 
-/// Адреса локальных прокси, поднятых ядром.
+/// Адрес локального прокси, который прописывается в настройки системы.
+///
+/// Только HTTP. SOCKS-вход ядра существует и годится для ручной настройки, но
+/// в системные настройки он не попадает — почему, объяснено у
+/// [`proxy_server_value`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Endpoints {
     pub http: String,
-    pub socks: String,
 }
 
 /// Список адресов, которые должны идти напрямую, минуя прокси.
 ///
 /// Локальные и частные сети через прокси гонять незачем: это ломает доступ к
 /// принтерам, NAS и веб-интерфейсу роутера, а пользы не приносит.
-const BYPASS: &str = "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;\
+pub(crate) const BYPASS: &str = "localhost;127.*;10.*;172.16.*;172.17.*;172.18.*;172.19.*;\
 172.20.*;172.21.*;172.22.*;172.23.*;172.24.*;172.25.*;172.26.*;172.27.*;\
 172.28.*;172.29.*;172.30.*;172.31.*;192.168.*;169.254.*;<local>";
 
+/// То же самое для переменных окружения.
+///
+/// Синтаксис другой: разделитель — запятая, шаблоны со звёздочкой не приняты,
+/// частные сети записываются диапазонами. Кто их не разбирает, просто не
+/// найдёт совпадения — молчаливой поломки из этого не выйдет.
+const NO_PROXY: &str = "localhost,127.0.0.1,::1,10.0.0.0/8,172.16.0.0/12,\
+192.168.0.0/16,169.254.0.0/16";
+
+/// Переменные, которыми прокси объявляется миру Unix-соглашений.
+///
+/// Имена в Windows регистронезависимы, поэтому вариант в нижнем регистре
+/// заводить не нужно: `process.env.http_proxy` в Node найдёт `HTTP_PROXY`.
+const ENV_VARS: [&str; 2] = ["HTTP_PROXY", "HTTPS_PROXY"];
+const ENV_NO_PROXY: &str = "NO_PROXY";
+
+/// Значение переменной окружения для нашего прокси.
+///
+/// Со схемой: `http://` здесь обязателен, без него часть клиентов трактует
+/// строку как имя узла и обращается не туда.
+fn env_value(endpoints: &Endpoints) -> String {
+    format!("http://{}", endpoints.http)
+}
+
+/// Наше ли это значение переменной.
+///
+/// Трогаем только то, что указывает на localhost. Иначе один `sontd connect`
+/// снёс бы пользователю корпоративный прокси, прописанный до нас, и вернуть
+/// его было бы уже неоткуда.
+fn points_at_loopback(value: &str) -> bool {
+    let host = value
+        .split_once("://")
+        .map_or(value, |(_, rest)| rest)
+        .rsplit_once(':')
+        .map_or(value, |(host, _)| host)
+        .trim_matches(['[', ']']);
+
+    matches!(host, "127.0.0.1" | "localhost" | "::1") || host.starts_with("127.")
+}
+
 /// Строка настроек прокси в формате WinINET.
 ///
-/// HTTP и HTTPS направляются на HTTP-вход ядра, а `socks=` добавляется для
-/// приложений, которые умеют SOCKS и предпочитают его.
+/// Только `http=` и `https=`, оба на HTTP-вход ядра.
+///
+/// # Почему здесь нет `socks=`
+///
+/// Раньше строка выглядела как `http=…;https=…;socks=…`, и это ломало ровно
+/// тот класс приложений, ради которого режим и существует, — десктопные
+/// веб-приложения на Chromium (Electron).
+///
+/// Chromium разбирает эту строку сам и для схем `ws://` и `wss://` **намеренно
+/// предпочитает** запись `socks=` записи `https=` — так рекомендует RFC 6455
+/// §4.1.3. При этом `socks=host:port` из настроек Windows он трактует как
+/// **SOCKS4**, а у SOCKS4 нет поля для имени узла: клиент обязан резолвить имя
+/// сам и отправить готовый IPv4.
+///
+/// Что из этого следует в режиме прокси, где TUN-адаптера нет:
+///
+/// * DNS-запрос уходит к резолверу провайдера мимо туннеля — и утечкой, и,
+///   что хуже, поводом для блокировки: подменённый ответ определяет адрес,
+///   к которому приложение затем честно подключится через туннель;
+/// * узлы, доступные только по IPv6, недостижимы в принципе.
+///
+/// А WebSocket — это и есть транспорт десктопных веб-приложений. Снаружи
+/// выглядит так, будто VPN включён, но приложение работает мимо него.
+///
+/// Проверено замером: с `socks=` Chromium шлёт на этот адрес
+/// `04 01 01bb <ipv4> 00` (SOCKS4 CONNECT с уже разрешённым адресом), без него
+/// — `CONNECT узел:443` на HTTP-вход, где имя разрешает уже ядро на той
+/// стороне туннеля.
+///
+/// Сам SOCKS-вход никуда не делся: его адрес сообщают `sontd connect` и
+/// `sontd status` для приложений, которые настраиваются вручную. Он просто не
+/// объявляется всей системе.
 fn proxy_server_value(endpoints: &Endpoints) -> String {
-    format!(
-        "http={http};https={http};socks={socks}",
-        http = endpoints.http,
-        socks = endpoints.socks
-    )
+    format!("http={http};https={http}", http = endpoints.http)
 }
 
 #[cfg(windows)]
@@ -53,10 +153,12 @@ mod platform {
     };
     use windows_sys::Win32::System::Registry::{
         RegCloseKey, RegCreateKeyExW, RegDeleteValueW, RegSetValueExW, HKEY, HKEY_CURRENT_USER,
-        KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
+        KEY_QUERY_VALUE, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE, REG_SZ,
     };
 
     const SETTINGS_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Internet Settings";
+    /// Ветка пользовательских переменных окружения.
+    const ENV_KEY: &str = "Environment";
 
     fn wide(value: &str) -> Vec<u16> {
         value.encode_utf16().chain(std::iter::once(0)).collect()
@@ -71,8 +173,8 @@ mod platform {
         }
     }
 
-    fn open_settings() -> io::Result<Key> {
-        let path = wide(SETTINGS_KEY);
+    fn open_key(path: &str, access: u32) -> io::Result<Key> {
+        let path = wide(path);
         let mut handle: HKEY = std::ptr::null_mut();
 
         // SAFETY: путь завершён нулём, выходной параметр указывает на стек.
@@ -83,7 +185,7 @@ mod platform {
                 0,
                 std::ptr::null(),
                 REG_OPTION_NON_VOLATILE,
-                KEY_SET_VALUE,
+                access,
                 std::ptr::null(),
                 &mut handle,
                 std::ptr::null_mut(),
@@ -93,6 +195,10 @@ mod platform {
             return Err(io::Error::from_raw_os_error(status as i32));
         }
         Ok(Key(handle))
+    }
+
+    fn open_settings() -> io::Result<Key> {
+        open_key(SETTINGS_KEY, KEY_SET_VALUE)
     }
 
     fn set_string(key: &Key, name: &str, value: &str) -> io::Result<()> {
@@ -160,18 +266,124 @@ mod platform {
         }
     }
 
+    /// Сообщает системе, что изменились пользовательские переменные окружения.
+    ///
+    /// Без этого их не увидит даже вновь запущенное приложение: Explorer
+    /// раздаёт дочерним процессам ту копию окружения, что прочитал сам, и
+    /// перечитывает её только по этому сообщению.
+    fn notify_environment() {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SendMessageTimeoutW, HWND_BROADCAST, SMTO_ABORTIFHUNG, WM_SETTINGCHANGE,
+        };
+
+        let topic = wide(ENV_KEY);
+        // SAFETY: строка завершена нулём и живёт до конца вызова; таймаут не
+        // даёт застрять на зависшем окне.
+        unsafe {
+            SendMessageTimeoutW(
+                HWND_BROADCAST,
+                WM_SETTINGCHANGE,
+                0,
+                topic.as_ptr() as isize,
+                SMTO_ABORTIFHUNG,
+                1000,
+                std::ptr::null_mut(),
+            );
+        }
+    }
+
+    /// Прописывает `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`.
+    ///
+    /// Чужие значения не трогаем: если переменная уже указывает не на
+    /// localhost, её поставил не мы — скорее всего это корпоративный прокси,
+    /// и затирать его нельзя.
+    pub(super) fn apply_env(endpoints: &super::Endpoints) -> io::Result<()> {
+        let key = open_key(ENV_KEY, KEY_QUERY_VALUE | KEY_SET_VALUE)?;
+        let value = super::env_value(endpoints);
+        let mut changed = false;
+
+        for name in super::ENV_VARS {
+            match read_string(&key, name) {
+                Some(existing)
+                    if !existing.trim().is_empty() && !super::points_at_loopback(&existing) =>
+                {
+                    tracing::warn!(
+                        variable = name,
+                        "переменная уже задана и указывает не на localhost — оставляю как есть"
+                    );
+                }
+                _ => {
+                    set_string(&key, name, &value)?;
+                    changed = true;
+                }
+            }
+        }
+
+        if changed {
+            set_string(&key, super::ENV_NO_PROXY, super::NO_PROXY)?;
+            notify_environment();
+        }
+        Ok(())
+    }
+
+    /// Убирает переменные, но только свои.
+    pub(super) fn clear_env() -> io::Result<()> {
+        let key = open_key(ENV_KEY, KEY_QUERY_VALUE | KEY_SET_VALUE)?;
+        let mut changed = false;
+
+        for name in super::ENV_VARS {
+            let Some(existing) = read_string(&key, name) else {
+                continue;
+            };
+            if !super::points_at_loopback(&existing) {
+                continue;
+            }
+            let wide_name = wide(name);
+            // SAFETY: имя завершено нулём; отсутствие значения не ошибка.
+            unsafe { RegDeleteValueW(key.0, wide_name.as_ptr()) };
+            changed = true;
+        }
+
+        if changed {
+            let wide_name = wide(super::ENV_NO_PROXY);
+            // SAFETY: см. выше.
+            unsafe { RegDeleteValueW(key.0, wide_name.as_ptr()) };
+            notify_environment();
+        }
+        Ok(())
+    }
+
+    /// Значение пользовательской переменной окружения — как оно лежит в
+    /// реестре, а не как его видит текущий процесс.
+    ///
+    /// Разница существенная: свою копию окружения процесс получил при запуске
+    /// и об изменениях не узнаёт, поэтому проверять запись через `std::env`
+    /// бессмысленно.
+    #[cfg(test)]
+    pub(super) fn env_var(name: &str) -> Option<String> {
+        let key = open_key(ENV_KEY, KEY_QUERY_VALUE).ok()?;
+        read_string(&key, name).filter(|v| !v.is_empty())
+    }
+
     pub fn apply(endpoints: &super::Endpoints) -> io::Result<()> {
         let key = open_settings()?;
         set_string(&key, "ProxyServer", &super::proxy_server_value(endpoints))?;
         set_string(&key, "ProxyOverride", super::BYPASS)?;
         set_dword(&key, "ProxyEnable", 1)?;
         notify();
+
+        // Переменные окружения — вторая половина дела, и неудача здесь не
+        // повод считать, что прокси не включён: настройки Windows уже стоят, и
+        // браузеры через них пойдут.
+        if let Err(e) = apply_env(endpoints) {
+            tracing::error!(error = %e, "не удалось задать переменные окружения прокси");
+        }
         Ok(())
     }
 
     /// Что сейчас прописано в настройках системы.
     pub fn current() -> Option<(bool, String)> {
-        use windows_sys::Win32::System::Registry::{RegOpenKeyExW, KEY_QUERY_VALUE};
+        use windows_sys::Win32::System::Registry::RegOpenKeyExW;
 
         let path = wide(SETTINGS_KEY);
         let mut handle: HKEY = std::ptr::null_mut();
@@ -261,6 +473,12 @@ mod platform {
     }
 
     pub fn clear() -> io::Result<()> {
+        // Переменные снимаем первыми и независимо от исхода остального:
+        // оставленный `HTTPS_PROXY`, за которым больше никого нет, ломает
+        // вообще всю работу в командной строке — и никак не связывается
+        // пользователем с VPN, который он выключил час назад.
+        let env = clear_env();
+
         let key = open_settings()?;
 
         // Выключаем прокси, но саму строку адреса удаляем тоже: оставленный
@@ -273,7 +491,7 @@ mod platform {
         unsafe { RegDeleteValueW(key.0, name.as_ptr()) };
 
         notify();
-        Ok(())
+        env
     }
 }
 
@@ -347,16 +565,27 @@ mod tests {
     fn endpoints() -> Endpoints {
         Endpoints {
             http: "127.0.0.1:18966".to_owned(),
-            socks: "127.0.0.1:18965".to_owned(),
         }
     }
 
     #[test]
-    fn proxy_value_covers_http_https_and_socks() {
+    fn proxy_value_covers_http_and_https() {
         let value = proxy_server_value(&endpoints());
         assert!(value.contains("http=127.0.0.1:18966"));
         assert!(value.contains("https=127.0.0.1:18966"));
-        assert!(value.contains("socks=127.0.0.1:18965"));
+    }
+
+    #[test]
+    fn proxy_value_never_announces_socks() {
+        // Chromium предпочитает запись `socks=` для ws/wss и говорит с ней по
+        // SOCKS4, резолвя имя узла локально. Для десктопных веб-приложений это
+        // означает DNS мимо туннеля и подчинение блокировкам провайдера при
+        // формально поднятом VPN. Подробности — у `proxy_server_value`.
+        let value = proxy_server_value(&endpoints());
+        assert!(
+            !value.contains("socks"),
+            "socks= в системных настройках уводит WebSocket Chromium мимо туннеля: {value}"
+        );
     }
 
     #[test]
@@ -392,6 +621,49 @@ mod tests {
     }
 
     #[test]
+    fn env_value_carries_the_scheme() {
+        // Без `http://` часть клиентов принимает строку за имя узла.
+        assert_eq!(env_value(&endpoints()), "http://127.0.0.1:18966");
+    }
+
+    #[test]
+    fn our_own_values_are_recognised() {
+        for value in [
+            "http://127.0.0.1:18966",
+            "127.0.0.1:18966",
+            "http://localhost:18966",
+            "http://127.1.2.3:18966",
+        ] {
+            assert!(points_at_loopback(value), "не опознано своим: {value}");
+        }
+    }
+
+    #[test]
+    fn foreign_proxy_is_left_alone() {
+        // Затереть корпоративный прокси — значит отобрать у пользователя сеть
+        // способом, который он никак не свяжет с VPN.
+        for value in [
+            "http://proxy.corp.example:3128",
+            "http://10.0.0.5:8080",
+            "proxy.example:3128",
+        ] {
+            assert!(!points_at_loopback(value), "чужое принято за своё: {value}");
+        }
+    }
+
+    #[test]
+    fn no_proxy_keeps_local_traffic_local() {
+        // Иначе через прокси уйдёт обращение к самому себе и к локальной сети.
+        for entry in ["localhost", "127.0.0.1", "192.168.0.0/16"] {
+            assert!(NO_PROXY.contains(entry), "нет исключения для {entry}");
+        }
+        assert!(
+            !NO_PROXY.contains(';'),
+            "здесь разделитель — запятая, точка с запятой из формата WinINET"
+        );
+    }
+
+    #[test]
     fn local_and_private_networks_bypass_the_proxy() {
         // Иначе ломается доступ к роутеру, принтерам и сетевым хранилищам.
         for network in ["localhost", "127.*", "192.168.*", "10.*", "<local>"] {
@@ -408,9 +680,58 @@ mod tests {
         }
     }
 
+    /// Замок для проверок, которые ходят в настоящий реестр.
+    ///
+    /// Реестр один на процесс, а тесты идут параллельно: без замка `clear()`
+    /// одного теста стирает переменные, которые только что записал другой, и
+    /// падение зависит от того, кто успел первым. Такой тест хуже
+    /// отсутствующего — он подрывает доверие ко всему прогону.
+    #[cfg(windows)]
+    static REGISTRY: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[cfg(windows)]
+    #[test]
+    fn environment_variables_are_written_and_taken_back() {
+        let _guard = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
+        // Проверка ходит в настоящий реестр: ломается здесь именно запись, а
+        // подстановка строк проверена выше и без неё.
+        //
+        // Чужой прокси не трогаем — тогда и восстанавливать нечего. Если он на
+        // машине есть, проверять тут нечего: этот случай отдельно проверен
+        // в `foreign_proxy_is_left_alone`.
+        let occupied = ENV_VARS
+            .iter()
+            .filter_map(|name| platform::env_var(name))
+            .any(|value| !points_at_loopback(&value));
+        if occupied {
+            return;
+        }
+
+        platform::apply_env(&endpoints()).expect("переменные должны записаться");
+        for name in ENV_VARS {
+            assert_eq!(
+                platform::env_var(name).as_deref(),
+                Some("http://127.0.0.1:18966"),
+                "{name} не записана"
+            );
+        }
+        assert_eq!(platform::env_var(ENV_NO_PROXY).as_deref(), Some(NO_PROXY));
+
+        platform::clear_env().expect("переменные должны сняться");
+        for name in ENV_VARS {
+            assert_eq!(platform::env_var(name), None, "{name} осталась висеть");
+        }
+        assert_eq!(
+            platform::env_var(ENV_NO_PROXY),
+            None,
+            "NO_PROXY без прокси бессмысленна и должна уйти вместе с ним"
+        );
+    }
+
     #[cfg(windows)]
     #[test]
     fn clearing_when_nothing_was_set_is_not_an_error() {
+        let _guard = REGISTRY.lock().unwrap_or_else(|e| e.into_inner());
         // Отключение может произойти без предшествующего включения — например,
         // после перезапуска клиента. Ошибкой это быть не должно.
         assert!(clear().is_ok());

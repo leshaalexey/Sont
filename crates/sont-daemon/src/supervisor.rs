@@ -50,11 +50,21 @@ const HEALTH_FAILURES_BEFORE_RECONNECT: u32 = 2;
 /// Потолок паузы между попытками переподключения.
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 
-/// После скольких неудач подряд пробуем другой сервер.
+/// Как часто перемеряем задержку до серверов в фоне.
 ///
-/// Упорствовать на одном сервере бессмысленно, если он просто лёг: у
-/// пользователя в подписке есть другие.
-const SWITCH_SERVER_AFTER: u32 = 3;
+/// Замер нужен не сам по себе, а чтобы было на чём основать выбор сервера в
+/// момент падения текущего. Мерить тогда уже поздно: пользователь сидит без
+/// сети и ждёт. Поэтому меряем заранее и регулярно — TCP-соединение к каждому
+/// серверу раз в несколько минут не стоит ничего.
+const PROBE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Сколько упавший сервер не рассматривается при выборе замены.
+///
+/// Без этого срока переключение вырождается в возврат: сервер лёг, мы ушли на
+/// второй, второй оказался медленнее — и «лучший по пингу» снова показывает на
+/// первый, который всё ещё лежит. Замер этого не покажет: TCP-соединение к
+/// упавшему VLESS-серверу устанавливается прекрасно, отказывает уже туннель.
+const FAILED_SERVER_COOLDOWN: Duration = Duration::from_secs(600);
 
 /// Пауза перед попыткой номер `attempt`.
 ///
@@ -84,8 +94,13 @@ pub struct SupervisorConfig {
     pub demo_servers: bool,
     pub settings_path: PathBuf,
     pub favorites_path: PathBuf,
-    pub subscription_path: PathBuf,
-    pub servers_cache_path: PathBuf,
+    /// Все подписки одним зашифрованным файлом.
+    pub subscriptions_path: PathBuf,
+    /// Файлы прежней, одноподписочной раскладки.
+    ///
+    /// Читаются при первом запуске новой версии и после переноса удаляются.
+    pub legacy_subscription_path: PathBuf,
+    pub legacy_servers_cache_path: PathBuf,
     /// Путь к бинарю ядра Xray.
     pub core_binary: PathBuf,
     /// Куда пишется сгенерированная конфигурация ядра.
@@ -100,26 +115,60 @@ pub enum Internal {
     /// Ядро и сетевой слой подняты, связность подтверждена.
     CoreStarted {
         generation: u64,
-        result: Result<Started, TunnelError>,
+        /// В коробке: `Started` несёт дескриптор процесса ядра и задачу
+        /// сетевого слоя и весит сотни байт. Без неё этот вес лежал бы в
+        /// каждом сообщении канала, включая односложные.
+        result: Box<Result<Started, TunnelError>>,
     },
     DisconnectFinished {
         generation: u64,
     },
-    SubscriptionFetched(Result<Fetched, FetchError>),
+    SubscriptionFetched {
+        id: SubscriptionId,
+        result: Result<Fetched, FetchError>,
+    },
     /// Версия ядра, полученная при старте.
     CoreVersion(Option<String>),
     /// Показания счётчиков ядра.
     CoreStats(sont_xray::metrics::Counters),
     /// Результат проверки живости туннеля.
     HealthChecked { generation: u64, alive: bool },
+    /// Результаты замера задержки до серверов.
+    Probed(Vec<ProbeResult>),
 }
 
-/// Кэш разобранной подписки, переживающий перезапуск демона.
+/// Одна подписка со всем, что о ней известно.
 ///
-/// Без него после каждого старта пришлось бы ждать ответа панели, а если
-/// панель недоступна — оставаться без серверов, хотя ключ никуда не делся.
+/// Разобранные серверы лежат здесь же, а не отдельным кэшем: без них после
+/// каждого перезапуска демона пришлось бы ждать ответа панели, а если панель
+/// недоступна — оставаться без серверов, хотя ключ никуда не делся.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct SubscriptionEntry {
+    id: SubscriptionId,
+    /// Ключ подписки. Наружу не отдаётся никогда — ни в ответах, ни в событиях.
+    secret: Secret,
+    masked_url: String,
+    profiles: Vec<ServerProfile>,
+    info: SubscriptionInfo,
+}
+
+impl SubscriptionEntry {
+    fn status(&self) -> SubscriptionStatus {
+        SubscriptionStatus {
+            id: self.id.clone(),
+            masked_url: self.masked_url.clone(),
+            info: self.info.clone(),
+        }
+    }
+}
+
+/// Кэш разобранной подписки в раскладке до появления списка.
+///
+/// Нужен ровно для одного: прочитать то, что осталось от прежней версии, и
+/// перенести. Пользователь не должен вводить ключ заново из-за того, что у нас
+/// поменялась структура файлов.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct CachedSubscription {
+struct LegacyCachedSubscription {
     id: SubscriptionId,
     masked_url: String,
     profiles: Vec<ServerProfile>,
@@ -133,9 +182,13 @@ pub struct Supervisor {
     probes: HashMap<ProfileId, ProbeResult>,
     favorites: HashSet<ProfileId>,
     stats: Stats,
-    subscription: Option<SubscriptionStatus>,
-    /// Сам ключ подписки. Наружу не отдаётся никогда.
-    subscription_secret: Option<Secret>,
+    /// Подписки пользователя вместе с ключами и разобранными серверами.
+    ///
+    /// Порядок задаёт пользователь порядком добавления, и он же разрешает
+    /// столкновения: один и тот же сервер, пришедший из двух подписок, берётся
+    /// из первой. Иначе в списке была бы пара близнецов с одним id, и
+    /// избранное с закреплением перестали бы означать что-то определённое.
+    subscriptions: Vec<SubscriptionEntry>,
 
     events: broadcast::Sender<Event>,
     internal_tx: mpsc::Sender<Internal>,
@@ -161,7 +214,30 @@ pub struct Supervisor {
     ///
     /// Защита от накопления параллельных запросов, если пользователь нажимает
     /// «Обновить» несколько раз подряд.
-    fetching: bool,
+    fetching: HashSet<SubscriptionId>,
+
+    /// Адрес, объявленный машинной настройке WinHTTP, если он объявлен.
+    ///
+    /// Держим отдельно от `proxy`, потому что это не то же самое: `proxy` —
+    /// что подняло ядро, а здесь — что мы успели сообщить системе. Сравнение
+    /// двух значений и не даёт дёргать настройку на каждой смене состояния.
+    machine_proxy: Option<String>,
+
+    /// Серверы, на которых соединение недавно развалилось, и когда это было.
+    ///
+    /// Замер задержки такие серверы не отличает: до упавшего VLESS TCP доходит
+    /// прекрасно, не работает уже туннель поверх него. Без этой памяти выбор
+    /// «лучшего по пингу» немедленно вернул бы нас на тот же сервер.
+    failed_servers: HashMap<ProfileId, Instant>,
+
+    /// Идёт ли замер задержки прямо сейчас.
+    probing: bool,
+    /// Когда замер выполнялся в последний раз.
+    ///
+    /// Задержка — величина скоропортящаяся: маршрут меняется при переходе с
+    /// Wi-Fi на кабель, а сервер, вчера бывший лучшим, сегодня может лежать.
+    /// Выбирать по замеру недельной давности значит выбирать наугад.
+    last_probe: Instant,
 
     /// Номер текущего «намерения» пользователя.
     ///
@@ -185,6 +261,14 @@ pub struct Supervisor {
     health_failures: u32,
     /// Когда в последний раз проверяли живость.
     last_health_check: Instant,
+
+    /// Поднятая блокировка трафика, если kill-switch включён.
+    ///
+    /// Наличие значения — единственный источник правды для поля `blocked` в
+    /// состоянии. Выводить его из настройки нельзя: настройка говорит, чего
+    /// хочет пользователь, а фильтры могли не поставиться — например, у
+    /// демона не хватило прав.
+    firewall: Option<crate::firewall::Firewall>,
 }
 
 impl Supervisor {
@@ -192,14 +276,10 @@ impl Supervisor {
         let settings: Settings = store::load_or_default(&config.settings_path);
         let favorites: HashSet<ProfileId> = store::load_or_default(&config.favorites_path);
 
-        let mut servers = Vec::new();
-        let mut probes = HashMap::new();
-        let mut subscription = None;
-
-        if config.demo_servers {
+        let (subscriptions, servers, probes) = if config.demo_servers {
             tracing::warn!("включён демонстрационный набор серверов — подключение не выполняется");
-            servers = demo::servers();
-            probes = servers
+            let servers = demo::servers();
+            let probes = servers
                 .iter()
                 .map(|s| {
                     (
@@ -213,27 +293,21 @@ impl Supervisor {
                     )
                 })
                 .collect();
-        } else if let Some(cached) =
-            secrets::load_json::<CachedSubscription>(&config.servers_cache_path)
-        {
-            // Работаем на кэше, пока не придёт свежий ответ панели: иначе
-            // после перезапуска демона пользователь остаётся без серверов,
-            // хотя ключ на месте.
-            tracing::info!(count = cached.profiles.len(), "загружен кэш подписки");
-            servers = cached.profiles;
-            subscription = Some(SubscriptionStatus {
-                id: cached.id,
-                masked_url: cached.masked_url,
-                info: cached.info,
-            });
-        }
-
-        let subscription_secret = match secrets::load(&config.subscription_path) {
-            Ok(secret) => secret,
-            Err(e) => {
-                tracing::error!(error = %e, "не удалось прочитать сохранённый ключ подписки");
-                None
+            (Vec::new(), servers, probes)
+        } else {
+            let subscriptions = load_subscriptions(&config);
+            // Работаем на сохранённом разборе, пока не придёт свежий ответ
+            // панели: иначе после перезапуска демона пользователь остаётся без
+            // серверов, хотя ключи на месте.
+            let servers = merge_servers(&subscriptions);
+            if !subscriptions.is_empty() {
+                tracing::info!(
+                    subscriptions = subscriptions.len(),
+                    servers = servers.len(),
+                    "загружены сохранённые подписки"
+                );
             }
+            (subscriptions, servers, HashMap::new())
         };
 
         let http = match SubscriptionClient::new() {
@@ -253,6 +327,18 @@ impl Supervisor {
             Err(e) => tracing::warn!(error = %e, "ядро недоступно, подключение работать не будет"),
         }
 
+        // Постоянные фильтры от прошлого запуска.
+        //
+        // Пережить демона они могли только в режиме lockdown — там это по
+        // договору. Но если пользователь с тех пор блокировку выключил,
+        // снять их некому: новый демон о них ничего не знает и молча оставил
+        // бы машину без сети до `sontd firewall reset`.
+        if !settings.firewall.survives_daemon_crash() {
+            if let Err(e) = crate::firewall::reset() {
+                tracing::warn!(error = %e, "не удалось прибрать фильтры прошлого запуска");
+            }
+        }
+
         let (internal_tx, internal_rx) = mpsc::channel(16);
 
         Self {
@@ -268,8 +354,7 @@ impl Supervisor {
             probes,
             favorites,
             stats: Stats::default(),
-            subscription,
-            subscription_secret,
+            subscriptions,
             events,
             internal_tx,
             internal_rx,
@@ -277,13 +362,28 @@ impl Supervisor {
             config,
             started_at: Instant::now(),
             http,
-            fetching: false,
+            fetching: HashSet::new(),
+            // Не `None`, а то, что реально стоит в системе.
+            //
+            // Прошлый запуск демона мог закончиться падением или жёсткой
+            // остановкой службы прямо в режиме прокси. Считая, что ничего не
+            // применял, новый запуск не стал бы снимать оставшийся адрес — и
+            // тот висел бы, пока пользователь не догадается про `netsh`.
+            machine_proxy: crate::winhttp::ours_if_any(),
+            failed_servers: HashMap::new(),
+            probing: false,
+            // Так, чтобы первый замер случился сразу, а не через интервал:
+            // выбирать сервер по пингу можно только имея пинг.
+            last_probe: Instant::now()
+                .checked_sub(PROBE_INTERVAL)
+                .unwrap_or_else(Instant::now),
             generation: 0,
             pending_reason: None,
             desired: Desired::Disconnected,
             reconnect_attempt: 0,
             health_failures: 0,
             last_health_check: Instant::now(),
+            firewall: None,
         }
     }
 
@@ -303,6 +403,12 @@ impl Supervisor {
         stats_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         tracing::info!("supervisor запущен");
+
+        // Приводим машинную настройку в соответствие сразу, не дожидаясь
+        // первой смены состояния: если её вообще не будет — автоподключение
+        // выключено, пользователь ничего не нажимает, — оставшийся от прошлого
+        // запуска адрес провисел бы до перезагрузки.
+        self.sync_machine_proxy();
 
         // Версию ядра узнаём в фоне: запуск демона не должен зависеть от
         // того, как быстро отвечает сторонний процесс.
@@ -354,6 +460,7 @@ impl Supervisor {
                     // незачем, а состояние надо поправить немедленно.
                     self.supervise();
                     self.tick_stats();
+                    self.tick_probe();
                 }
             }
         }
@@ -364,6 +471,18 @@ impl Supervisor {
         if let Some(active) = self.active.take() {
             tracing::info!("останавливаю туннель перед выходом");
             shutdown_started(active).await;
+        }
+
+        // То же самое и по той же причине — с машинной настройкой прокси.
+        // Оставленный адрес, за которым больше никого нет, ломает обновления
+        // системы, и связать это с выключенным вчера VPN пользователь не
+        // сможет. Снять её после нашего выхода будет некому.
+        if self.machine_proxy.is_some() {
+            if let Err(e) = crate::winhttp::clear() {
+                tracing::error!(error = %e, "не удалось снять машинный прокси при выходе");
+            } else {
+                tracing::info!("машинный прокси WinHTTP снят перед выходом");
+            }
         }
     }
 
@@ -387,19 +506,33 @@ impl Supervisor {
                 Response::Accepted
             }
 
-            Request::SetSubscription { url } => self.set_subscription(url),
+            Request::AddSubscription { url } => self.add_subscription(url),
+
+            Request::RemoveSubscription { id } => self.remove_subscription(&id),
+
+            Request::ListSubscriptions => Response::Subscriptions(self.subscription_statuses()),
+
+            Request::RevealSubscription { id } => match self
+                .subscriptions
+                .iter()
+                .find(|e| e.id == id)
+            {
+                // Намеренно без записи в журнал: ключ не должен оказаться в
+                // файле из-за того, что пользователь нажал «скопировать».
+                Some(entry) => Response::SubscriptionSecret(entry.secret.clone()),
+                None => Response::Error(IpcError::InvalidRequest {
+                    detail: format!("подписка {id} не найдена"),
+                }),
+            },
 
             Request::ClearSubscription => {
-                self.subscription = None;
-                self.subscription_secret = None;
+                self.subscriptions.clear();
                 self.servers.clear();
                 self.probes.clear();
+                self.persist_subscriptions();
 
-                if let Err(e) = secrets::clear(&self.config.subscription_path) {
-                    tracing::error!(error = %e, "не удалось удалить ключ подписки");
-                }
-                if let Err(e) = secrets::clear(&self.config.servers_cache_path) {
-                    tracing::error!(error = %e, "не удалось удалить кэш подписки");
+                if let Err(e) = secrets::clear(&self.config.subscriptions_path) {
+                    tracing::error!(error = %e, "не удалось удалить подписки");
                 }
 
                 self.emit(Event::ServerListUpdated { count: 0 });
@@ -410,22 +543,23 @@ impl Supervisor {
                 Response::Accepted
             }
 
-            Request::RefreshSubscription => match self.begin_fetch() {
+            Request::RefreshSubscription { id } => match self.begin_fetch(id.as_ref()) {
                 Ok(()) => Response::Accepted,
                 Err(e) => Response::Error(e),
             },
 
             Request::ListServers => Response::Servers(self.server_views()),
 
-            Request::ProbeServers { .. } => {
+            Request::ProbeServers { servers } => {
                 if self.servers.is_empty() {
                     return Response::Error(IpcError::Tunnel(TunnelError::NoUsableServers));
                 }
-                // Замеры появятся вместе с probe::Prober; сейчас отдаём то,
-                // что уже известно, не выдавая это за свежий результат.
-                for probe in self.probes.values().cloned().collect::<Vec<_>>() {
-                    self.emit(Event::Probe(probe));
-                }
+                self.begin_probe(servers);
+                Response::Accepted
+            }
+
+            Request::ProxyAnnounced => {
+                self.reset_connections_after_announcement();
                 Response::Accepted
             }
 
@@ -449,7 +583,39 @@ impl Supervisor {
         }
     }
 
-    fn set_subscription(&mut self, url: Secret) -> Response {
+    fn subscription_statuses(&self) -> Vec<SubscriptionStatus> {
+        self.subscriptions.iter().map(SubscriptionEntry::status).collect()
+    }
+
+    /// Сохраняет список подписок на диск.
+    ///
+    /// Отдельным методом, потому что вызывается из каждой операции над
+    /// списком: пропусти один вызов — и подписка исчезнет при перезапуске
+    /// демона, причём заметит это пользователь далеко не сразу.
+    fn persist_subscriptions(&self) {
+        if self.config.demo_servers {
+            // Демонстрационный набор ничей: записав его на диск, мы затёрли бы
+            // настоящие подписки пользователя, случайно запустившего демон с
+            // этим флагом.
+            return;
+        }
+        if let Err(e) = secrets::store_json(&self.config.subscriptions_path, &self.subscriptions) {
+            tracing::error!(error = %e, "не удалось сохранить подписки");
+        }
+    }
+
+    /// Пересобирает общий список серверов и выбрасывает замеры исчезнувших.
+    fn rebuild_servers(&mut self) {
+        self.servers = merge_servers(&self.subscriptions);
+
+        // Замеры серверов, которых больше нет, только занимают место и путают
+        // автовыбор: он предпочтёт «известный быстрый» сервер, которого уже
+        // не существует.
+        let live: HashSet<ProfileId> = self.servers.iter().map(|s| s.id.clone()).collect();
+        self.probes.retain(|id, _| live.contains(id));
+    }
+
+    fn add_subscription(&mut self, url: Secret) -> Response {
         let raw = url.expose();
         if !(raw.starts_with("https://") || raw.starts_with("http://")) {
             return Response::Error(IpcError::InvalidRequest {
@@ -463,78 +629,288 @@ impl Supervisor {
             tracing::warn!("подписка получается по незашифрованному http");
         }
 
-        let status = SubscriptionStatus {
-            id: SubscriptionId::from_url(raw),
-            masked_url: url.masked(),
-            info: SubscriptionInfo::default(),
-        };
+        let id = SubscriptionId::from_url(raw);
 
-        // Ключ от другой подписки — прежние серверы к нему отношения не имеют.
-        self.servers.clear();
-        self.probes.clear();
+        // Повторное добавление той же ссылки — обновление, а не дубликат.
+        // Пользователь, вставивший её дважды, ожидает одну подписку, а не две
+        // одинаковые, из которых серверы потом придут парами.
+        let existing = self.subscriptions.iter().position(|e| e.id == id);
 
-        if let Err(e) = secrets::store(&self.config.subscription_path, &url) {
-            tracing::error!(error = %e, "не удалось сохранить ключ подписки");
-            return Response::Error(IpcError::Internal {
-                detail: format!("не удалось сохранить ключ: {e}"),
-            });
+        match existing {
+            Some(i) => {
+                tracing::info!("подписка уже добавлена, ключ обновлён");
+                self.subscriptions[i].masked_url = url.masked();
+                self.subscriptions[i].secret = url;
+            }
+            None => {
+                self.subscriptions.push(SubscriptionEntry {
+                    id: id.clone(),
+                    masked_url: url.masked(),
+                    secret: url,
+                    profiles: Vec::new(),
+                    info: SubscriptionInfo::default(),
+                });
+                tracing::info!(total = self.subscriptions.len(), "подписка добавлена");
+            }
         }
 
-        self.subscription_secret = Some(url);
-        self.subscription = Some(status);
-        tracing::info!("ключ подписки сохранён");
+        self.persist_subscriptions();
 
         // Событие `SubscriptionUpdated` намеренно не публикуем здесь: оно
         // означает «подписка прочитана» и должно нести настоящие данные.
         // Сообщив о сохранении ключа тем же событием с пустыми показателями,
         // мы заставили бы подписчиков принять заглушку за результат загрузки.
-        self.emit(Event::ServerListUpdated { count: 0 });
 
         // Сразу пробуем прочитать: пользователь должен увидеть результат
         // ввода ключа, а не пустой список с предложением что-то обновить.
-        if let Err(e) = self.begin_fetch() {
+        if let Err(e) = self.begin_fetch(Some(&id)) {
             return Response::Error(e);
         }
 
         Response::Accepted
     }
 
-    /// Запускает фоновое получение подписки.
-    fn begin_fetch(&mut self) -> Result<(), IpcError> {
-        let Some(secret) = self.subscription_secret.clone() else {
-            return Err(IpcError::Tunnel(TunnelError::NoSubscription));
+    fn remove_subscription(&mut self, id: &SubscriptionId) -> Response {
+        let Some(i) = self.subscriptions.iter().position(|e| &e.id == id) else {
+            return Response::Error(IpcError::InvalidRequest {
+                detail: format!("подписка {id} не найдена"),
+            });
         };
+
+        let removed = self.subscriptions.remove(i);
+        tracing::info!(
+            servers = removed.profiles.len(),
+            left = self.subscriptions.len(),
+            "подписка удалена"
+        );
+
+        let current = self.state.server().cloned();
+        self.rebuild_servers();
+        self.persist_subscriptions();
+
+        self.emit(Event::ServerListUpdated {
+            count: self.servers.len() as u32,
+        });
+
+        // Если соединение держалось на сервере из удалённой подписки, его
+        // нельзя оставить: пользователь считает, что доступа к ней больше нет,
+        // а трафик продолжал бы идти через её сервер.
+        let lost = current.is_some_and(|id| !self.servers.iter().any(|s| s.id == id));
+        if lost && !matches!(self.state, TunnelState::Disconnected { .. }) {
+            tracing::info!("текущий сервер пришёл из удалённой подписки, переподключаюсь");
+            if self.servers.is_empty() {
+                self.begin_disconnect(DisconnectReason::Reconfigured);
+            } else {
+                self.begin_reconnect(ReconnectCause::ServerSwitched);
+            }
+        }
+
+        Response::Accepted
+    }
+
+    /// Перемеряет задержку, если прошлый замер устарел.
+    ///
+    /// Замер идёт и при поднятом соединении. Числа при этом получаются
+    /// завышенными — до чужого сервера мы идём сквозь туннель, — но сравнимыми
+    /// между собой, а для выбора «куда переключиться» важен именно порядок.
+    fn tick_probe(&mut self) {
+        let interval = Duration::from_secs(u64::from(self.settings.probe_interval_secs));
+        if self.servers.is_empty() || self.last_probe.elapsed() < interval {
+            return;
+        }
+        self.begin_probe(None);
+    }
+
+    /// Запускает фоновый замер задержки.
+    ///
+    /// `None` — мерить все известные серверы.
+    ///
+    /// Молча ничего не делает, если замер уже идёт: пользователь может нажать
+    /// «обновить» несколько раз подряд, и превращать это в десяток параллельных
+    /// заходов на каждый сервер подписки незачем.
+    fn begin_probe(&mut self, only: Option<Vec<ProfileId>>) {
+        if self.probing {
+            return;
+        }
+
+        let targets: Vec<ServerProfile> = match &only {
+            Some(ids) => self
+                .servers
+                .iter()
+                .filter(|s| ids.contains(&s.id))
+                .cloned()
+                .collect(),
+            None => self.servers.clone(),
+        };
+
+        if targets.is_empty() {
+            return;
+        }
+
+        self.probing = true;
+        self.last_probe = Instant::now();
+
+        let tx = self.internal_tx.clone();
+        tokio::spawn(async move {
+            let results = crate::probe::many(targets).await;
+            let _ = tx.send(Internal::Probed(results)).await;
+        });
+    }
+
+    /// Переходит ли демон на сервер, который оказался заметно быстрее.
+    ///
+    /// Проверяется после каждого замера. Смена сервера рвёт все соединения,
+    /// поэтому порог здесь не украшение, а условие осмысленности: без него
+    /// демон переподключался бы на каждом дрожании замера, и пользователь
+    /// получал бы обрывы вместо выигрыша в десяток миллисекунд.
+    fn consider_better_server(&mut self) {
+        if !self.settings.auto_switch || !self.state.is_connected() {
+            return;
+        }
+        // Пользователь закрепил сервер сам — не спорим с ним.
+        if !self.settings.auto_select_server {
+            return;
+        }
+
+        let Some(current) = self.state.server().cloned() else {
+            return;
+        };
+        let Some(current_rtt) = self.probes.get(&current).and_then(|p| p.rtt_ms) else {
+            // Текущий сервер не измерен: сравнивать не с чем, а менять его
+            // «вслепую» — это не улучшение, а лотерея.
+            return;
+        };
+
+        let Some(candidate) = self.best_by_probe(Some(&current)) else {
+            return;
+        };
+        let Some(candidate_rtt) = self.probes.get(&candidate).and_then(|p| p.rtt_ms) else {
+            return;
+        };
+
+        let gain = current_rtt.saturating_sub(candidate_rtt);
+        if gain < self.settings.switch_threshold_ms {
+            return;
+        }
+
+        tracing::info!(
+            from = %current,
+            to = %candidate,
+            gain_ms = gain,
+            "нашёлся сервер быстрее, перехожу"
+        );
+        self.begin_switch(candidate, ReconnectCause::BetterServerFound { gain_ms: gain });
+    }
+
+    /// Переходит на другой сервер по собственному решению демона.
+    ///
+    /// Отличается от восстановления тем, что ничего не сломалось: паузы перед
+    /// попыткой нет, счётчик неудач не растёт, а прежний сервер не попадает в
+    /// штрафной ящик — он исправен, просто нашёлся быстрее.
+    fn begin_switch(&mut self, target: ProfileId, cause: ReconnectCause) {
+        if !matches!(self.desired, Desired::Connected { .. }) {
+            return;
+        }
+
+        self.set_state(TunnelState::Reconnecting {
+            server: target.clone(),
+            cause,
+            attempt: 1,
+        });
+
+        let previous = self.active.take();
+        if let Err(e) = self.launch(target, previous, Duration::ZERO) {
+            tracing::error!(error = %e, "не удалось перейти на другой сервер");
+            self.fail(e);
+        }
+    }
+
+    /// Принимает результаты замера.
+    fn apply_probes(&mut self, results: Vec<ProbeResult>) {
+        self.probing = false;
+
+        let reachable = results.iter().filter(|p| p.is_reachable()).count();
+        tracing::info!(
+            measured = results.len(),
+            reachable,
+            "замер задержки завершён"
+        );
+
+        for probe in results {
+            self.probes.insert(probe.server.clone(), probe.clone());
+            self.emit(Event::Probe(probe));
+        }
+
+        // Свежие числа — единственный момент, когда решение о переходе на
+        // более быстрый сервер вообще обосновано.
+        self.consider_better_server();
+    }
+
+    /// Запускает фоновое получение подписок.
+    ///
+    /// `None` — перечитать все. Каждая читается своей задачей: одна недоступная
+    /// панель не должна задерживать остальные, а тем более отменять их.
+    fn begin_fetch(&mut self, only: Option<&SubscriptionId>) -> Result<(), IpcError> {
+        if self.subscriptions.is_empty() {
+            return Err(IpcError::Tunnel(TunnelError::NoSubscription));
+        }
         let Some(http) = self.http.clone() else {
             return Err(IpcError::Internal {
                 detail: "HTTP-клиент недоступен".into(),
             });
         };
 
-        if self.fetching {
-            // Не ошибка: запрос уже идёт, результат придёт событием.
-            return Ok(());
-        }
-        self.fetching = true;
+        let targets: Vec<(SubscriptionId, Secret)> = self
+            .subscriptions
+            .iter()
+            .filter(|e| only.is_none_or(|id| &e.id == id))
+            // Уже идущий запрос не дублируем: пользователь может нажать
+            // «обновить» несколько раз подряд, и превращать это в поток
+            // запросов к панели незачем.
+            .filter(|e| !self.fetching.contains(&e.id))
+            .map(|e| (e.id.clone(), e.secret.clone()))
+            .collect();
 
-        let tx = self.internal_tx.clone();
-        tokio::spawn(async move {
-            let result = http.fetch(&secret).await;
-            let _ = tx.send(Internal::SubscriptionFetched(result)).await;
-        });
+        if let Some(id) = only {
+            if !self.subscriptions.iter().any(|e| &e.id == id) {
+                return Err(IpcError::InvalidRequest {
+                    detail: format!("подписка {id} не найдена"),
+                });
+            }
+        }
+
+        for (id, secret) in targets {
+            self.fetching.insert(id.clone());
+            let http = http.clone();
+            let tx = self.internal_tx.clone();
+            tokio::spawn(async move {
+                let result = http.fetch(&secret).await;
+                let _ = tx.send(Internal::SubscriptionFetched { id, result }).await;
+            });
+        }
 
         Ok(())
     }
 
-    /// Применяет результат получения подписки.
-    fn apply_fetched(&mut self, result: Result<Fetched, FetchError>) {
-        self.fetching = false;
+    /// Применяет результат получения одной подписки.
+    fn apply_fetched(&mut self, id: SubscriptionId, result: Result<Fetched, FetchError>) {
+        self.fetching.remove(&id);
+
+        // Подписку могли удалить, пока запрос был в пути. Тогда результат
+        // относится к тому, чего уже нет, и применять его нельзя — иначе
+        // удалённая подписка вернулась бы сама собой.
+        let Some(index) = self.subscriptions.iter().position(|e| e.id == id) else {
+            tracing::debug!(%id, "ответ панели относится к удалённой подписке, отброшен");
+            return;
+        };
 
         let fetched = match result {
             Ok(f) => f,
             Err(e) => {
-                tracing::error!(error = %e, "не удалось обновить подписку");
-                // Старый список серверов остаётся в силе: недоступность
-                // панели не повод лишать пользователя работающих серверов.
+                tracing::error!(%id, error = %e, "не удалось обновить подписку");
+                // Прежние серверы этой подписки остаются в силе: недоступность
+                // панели не повод лишать пользователя работающих серверов. Тем
+                // более что остальные подписки при этом не пострадали.
                 self.emit(Event::Error(IpcError::Tunnel(
                     TunnelError::SubscriptionUnavailable {
                         detail: e.to_string(),
@@ -546,11 +922,12 @@ impl Supervisor {
 
         if fetched.skipped > 0 {
             tracing::warn!(
+                %id,
                 skipped = fetched.skipped,
                 "часть строк подписки не разобрана"
             );
         }
-        tracing::info!(count = fetched.profiles.len(), "подписка обновлена");
+        tracing::info!(%id, count = fetched.profiles.len(), "подписка обновлена");
 
         // Профиль, который текущее ядро не потянет, лучше отметить сразу:
         // иначе пользователь упрётся в непонятную ошибку при подключении.
@@ -562,39 +939,28 @@ impl Supervisor {
             );
         }
 
-        // Замеры серверов, которых больше нет в подписке, только занимают
-        // место и путают автовыбор.
-        let live: HashSet<ProfileId> = fetched.profiles.iter().map(|p| p.id.clone()).collect();
-        self.probes.retain(|id, _| live.contains(id));
-
-        self.servers = fetched.profiles;
-
         let mut info = fetched.info;
-        info.server_count = self.servers.len() as u32;
+        info.server_count = fetched.profiles.len() as u32;
 
-        if let Some(status) = self.subscription.as_mut() {
-            status.info = info.clone();
-        }
+        self.subscriptions[index].profiles = fetched.profiles;
+        self.subscriptions[index].info = info;
 
-        if let Some(status) = self.subscription.clone() {
-            let cache = CachedSubscription {
-                id: status.id.clone(),
-                masked_url: status.masked_url.clone(),
-                profiles: self.servers.clone(),
-                info,
-            };
-            if let Err(e) = secrets::store_json(&self.config.servers_cache_path, &cache) {
-                tracing::error!(error = %e, "не удалось сохранить кэш подписки");
-            }
-            self.emit(Event::SubscriptionUpdated(status));
-        }
+        self.rebuild_servers();
+        self.persist_subscriptions();
 
+        self.emit(Event::SubscriptionUpdated(self.subscriptions[index].status()));
         self.emit(Event::ServerListUpdated {
             count: self.servers.len() as u32,
         });
+
+        // Список изменился — прежние замеры описывают уже не его. Меряем
+        // сразу, а не через интервал: автовыбор и переключение при падении
+        // без свежих чисел работают вслепую.
+        self.begin_probe(None);
     }
 
     fn patch_settings(&mut self, patch: SettingsPatch) -> Response {
+        let firewall_before = self.settings.firewall;
         let outcome = patch.apply(&mut self.settings);
 
         if let Err(e) = store::save(&self.config.settings_path, &self.settings) {
@@ -604,11 +970,47 @@ impl Supervisor {
             });
         }
 
-        if outcome.needs_core_restart && self.state.is_connected() {
-            tracing::info!("настройки требуют перезапуска ядра");
+        // Смена режима состояние не меняет, поэтому машинную настройку надо
+        // поправить здесь: переключение на прокси должно объявить адрес сразу,
+        // а не после переподключения. Иначе между сменой режима и подъёмом
+        // нового ядра остаётся окно, в которое приложения уходят напрямую.
+        self.sync_machine_proxy();
+
+        // Настройка, требующая новой конфигурации ядра, применяется сама.
+        //
+        // Раньше здесь стояла только запись в журнал, и это была ловушка:
+        // пользователь переключал режим или DNS, видел новое значение в
+        // интерфейсе — и продолжал работать по старой конфигурации, пока не
+        // догадается переподключиться вручную. Настройка, которая показывает
+        // одно, а делает другое, хуже отсутствующей.
+        if outcome.needs_core_restart && self.state.holds_a_route() {
+            tracing::info!("настройки требуют новой конфигурации ядра, пересобираю соединение");
+            self.reconfigure();
         }
-        if outcome.needs_firewall_reapply {
-            tracing::info!("настройки требуют переприменения правил firewall");
+        // Kill-switch следует за настройкой сразу, а не со следующего
+        // подключения: пользователь, включивший блокировку, ожидает её
+        // прямо сейчас, а выключивший — ждёт, что интернет вернётся.
+        let firewall_changed = self.settings.firewall != firewall_before;
+        // Смена Auto на Lockdown и обратно меняет саму сессию WFP: у одной
+        // фильтры динамические, у другой постоянные. Переставить правила на
+        // месте нельзя, нужно снять и поднять заново.
+        if firewall_changed {
+            self.disengage_firewall();
+        }
+        if outcome.needs_firewall_reapply || firewall_changed {
+            let luid = match &self.state {
+                TunnelState::Connected { tun, .. } => tun.luid,
+                _ => None,
+            };
+            // Ставим только при живом намерении: включать блокировку у
+            // отключённого пользователя значит отрезать ему сеть настройкой,
+            // которая должна была её всего лишь защитить.
+            if matches!(self.desired, Desired::Connected { .. }) {
+                self.sync_firewall(luid);
+            } else {
+                self.disengage_firewall();
+            }
+            self.refresh_blocked();
         }
 
         Response::Settings(self.settings.clone())
@@ -628,7 +1030,107 @@ impl Supervisor {
             server: id.clone(),
             attempt: 1,
         });
-        self.launch(id, None, Duration::ZERO)
+
+        // Если пользователь просит подключиться, уже будучи подключённым
+        // (типично — чтобы применить смену режима), прежнюю сессию нельзя
+        // просто отбросить: `CoreProcess` и `Tunnel` не останавливаются в
+        // `Drop`, и забытый `Started` оставляет висеть процесс ядра и
+        // TUN-адаптер, за которым больше никто не следит и который нечем
+        // будет отключить.
+        let previous = self.active.take();
+        self.launch(id, previous, Duration::ZERO)
+    }
+
+    // ─────────────────────────── kill-switch ───────────────────────────
+
+    /// Что выпускается наружу мимо запрета при текущих настройках.
+    fn allowances(&self, tunnel_luid: Option<u64>) -> crate::firewall::Allowances {
+        // Ядро и сам демон — без них блокировка не даст подняться туннелю,
+        // который её же и оправдывает.
+        let mut apps = vec![self.config.core_binary.clone()];
+        if let Ok(exe) = std::env::current_exe() {
+            apps.push(exe);
+        }
+
+        // Только адреса-литералы: имя сервера ещё нужно разрешить, а
+        // резолвер в этот момент уже закрыт нашим же запретом. Разрешение
+        // имени делает ядро, и ему выход открыт по имени файла.
+        let servers = self
+            .servers
+            .iter()
+            .filter_map(|s| s.endpoint.host.parse::<std::net::IpAddr>().ok())
+            .collect();
+
+        crate::firewall::Allowances {
+            tunnel_luid,
+            apps,
+            servers,
+            allow_lan: self.settings.allow_lan,
+        }
+    }
+
+    /// Приводит блокировку в соответствие настройке и состоянию.
+    ///
+    /// Одна точка входа на все случаи: включили настройку, сменили
+    /// разрешения, поднялся туннель со своим LUID. Разведи это по трём
+    /// местам — и одно из них рано или поздно останется со старым набором
+    /// правил.
+    fn sync_firewall(&mut self, tunnel_luid: Option<u64>) {
+        if !self.settings.firewall.is_enabled() {
+            self.disengage_firewall();
+            return;
+        }
+
+        let allow = self.allowances(tunnel_luid);
+
+        if let Some(firewall) = self.firewall.as_ref() {
+            if let Err(e) = firewall.update(&allow) {
+                tracing::error!(error = %e, "не удалось переставить правила kill-switch");
+            }
+            return;
+        }
+
+        match crate::firewall::Firewall::engage(self.settings.firewall, &allow) {
+            Ok(firewall) => self.firewall = Some(firewall),
+            Err(e) => {
+                // Не подняли — значит не подняли: соврать `blocked: true`
+                // означало бы обещать защиту, которой нет.
+                tracing::error!(error = %e, "не удалось включить kill-switch");
+            }
+        }
+    }
+
+    fn disengage_firewall(&mut self) {
+        if let Some(firewall) = self.firewall.take() {
+            if let Err(e) = firewall.disengage() {
+                tracing::error!(error = %e, "не удалось снять kill-switch");
+            }
+        }
+    }
+
+    /// Приводит поле `blocked` в состоянии к тому, что на самом деле с
+    /// фильтрами.
+    ///
+    /// Нужно там, где блокировка меняется, а состояние — нет: пользователь
+    /// отключён и включает kill-switch. Само по себе «отключено» осталось
+    /// прежним, но интернет пропал, и молчание здесь оставило бы это без
+    /// объяснения.
+    fn refresh_blocked(&mut self) {
+        let blocked = self.firewall.is_some();
+        let updated = match &self.state {
+            TunnelState::Disconnected { reason, .. } => TunnelState::Disconnected {
+                reason: reason.clone(),
+                blocked,
+            },
+            TunnelState::Failed { error, .. } => TunnelState::Failed {
+                error: error.clone(),
+                blocked,
+            },
+            // В остальных состояниях `is_blocked` выводится из самого
+            // состояния и отдельного поля не имеет.
+            _ => return,
+        };
+        self.set_state(updated);
     }
 
     /// Запускает ядро и сетевой слой для выбранного сервера.
@@ -661,14 +1163,21 @@ impl Supervisor {
         self.generation += 1;
         let generation = self.generation;
 
-        // Служебный порт выбираем здесь, а не внутри фоновой задачи: его адрес
-        // нужен нам самим, чтобы потом снимать статистику.
-        let runtime = runtime_info(&self.settings);
-        self.metrics_url = Some(format!("http://{}/debug/vars", runtime.metrics_listen));
-        self.proxy = Some(sont_ipc::ProxyEndpoints {
-            http: runtime.http_listen.clone(),
-            socks: runtime.probe_listen.clone(),
-        });
+        // Блокировку ставим до того, как гасится прежний туннель, и без
+        // ссылки на новый: он ещё не существует. Иначе между снятием старого
+        // маршрута и появлением нового трафик уходит напрямую — то самое
+        // окно, ради которого kill-switch и заводят.
+        self.sync_firewall(None);
+
+        // Служебный порт статистики обнуляем: читать счётчики уже не у кого.
+        self.metrics_url = None;
+
+        // А вот адреса прокси держим прежними, хотя ядро ещё не поднялось.
+        //
+        // Они почти наверняка те же: порты предпочитаемые и постоянные. Но
+        // дело даже не в этом, а в том, что альтернатива — снять объявление на
+        // время переподключения, то есть открыть окно, в которое приложения
+        // уйдут напрямую. Пусть лучше несколько секунд получают отказ.
         self.last_counters = None;
         self.stats = Stats::default();
         self.health_failures = 0;
@@ -688,6 +1197,17 @@ impl Supervisor {
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
             }
+
+            // Порты выбираем только теперь.
+            //
+            // Раньше это делалось при постановке задачи — то есть пока прежнее
+            // ядро ещё держало сокеты. Предпочитаемый порт оказывался занят
+            // нами же, и локальный прокси уезжал на случайный номер при каждом
+            // переподключении. Для режима прокси это прямая поломка: адрес
+            // прописан в настройках системы, и переподключение по инициативе
+            // демона (упавшее ядро, неудачная проверка связи) оставляло эти
+            // настройки указывать на порт, где уже никого нет.
+            let runtime = runtime_info(&settings);
 
             // Общий предохранитель на всю последовательность.
             //
@@ -712,10 +1232,69 @@ impl Supervisor {
                     })
                 }
             };
-            let _ = tx.send(Internal::CoreStarted { generation, result }).await;
+            let _ = tx
+                .send(Internal::CoreStarted {
+                    generation,
+                    result: Box::new(result),
+                })
+                .await;
         });
 
         Ok(())
+    }
+
+    /// Пересобирает соединение под изменившиеся настройки.
+    ///
+    /// # Почему не `begin_reconnect`
+    ///
+    /// Восстановление — это ответ на неудачу: оно считает попытки, выжидает
+    /// паузу и, исчерпав бюджет, уходит на другой сервер. Здесь ничего не
+    /// падало, менять сервер не за что, а пауза — это лишние секунды без
+    /// связи.
+    ///
+    /// # Почему не только из `Connected`
+    ///
+    /// Настройку меняют и не дожидаясь подключения — переключили режим,
+    /// передумали, вернули обратно. Прежде такая правка просто не доходила
+    /// до ядра: перезапуск делался только из `Connected`, а попытка,
+    /// начатая до неё, доигрывала со старой конфигурацией и поднимала
+    /// соединение в том режиме, который пользователь уже отменил. Здесь
+    /// прежняя попытка вытесняется новой: её результат придёт с устаревшим
+    /// номером поколения, будет отброшен и погашен.
+    fn reconfigure(&mut self) {
+        if !matches!(self.desired, Desired::Connected { .. }) {
+            return;
+        }
+        let Some(target) = self.state.server().cloned() else {
+            return;
+        };
+
+        // Счётчик попыток обнуляем: смена настроек не должна приближать
+        // соединение к смене сервера.
+        self.reconnect_attempt = 0;
+
+        // Подключение, ещё не доведённое до конца, остаётся подключением:
+        // показать «восстанавливаю» тому, кто ни разу не был подключён,
+        // значит сообщить о разрыве, которого не было.
+        let state = if self.state.is_connected() {
+            TunnelState::Reconnecting {
+                server: target.clone(),
+                cause: ReconnectCause::Reconfigured,
+                attempt: 0,
+            }
+        } else {
+            TunnelState::Connecting {
+                server: target.clone(),
+                attempt: 1,
+            }
+        };
+        self.set_state(state);
+
+        let previous = self.active.take();
+        if let Err(e) = self.launch(target, previous, Duration::ZERO) {
+            tracing::error!(error = %e, "не удалось применить настройки к соединению");
+            self.fail(e);
+        }
     }
 
     /// Восстанавливает соединение после обрыва.
@@ -733,10 +1312,18 @@ impl Supervisor {
 
         let current = self.state.server().cloned();
 
-        // Упорствовать на одном сервере бессмысленно, если он лёг: в подписке
-        // есть другие, и пользователю важно вернуться в сеть, а не именно на
-        // этот сервер.
-        let target = if attempt > SWITCH_SERVER_AFTER {
+        // Отказал сам сервер — уходим с него сразу, не тратя попытки.
+        //
+        // Прежде демон трижды бился в упавший сервер и только потом брал
+        // следующий по списку. Обе части были неправильны: сервер, который
+        // только что уронил соединение, не станет рабочим через секунду, а
+        // «следующий по списку» — это не «лучший из имеющихся».
+        let target = if let (true, Some(failed)) = (server_at_fault(&cause), current.as_ref()) {
+            self.note_failure(failed, &cause)
+        } else if attempt > self.settings.reconnect_attempts {
+            // Причина не в сервере — сеть пропала, машина проснулась. Менять
+            // сервер сразу незачем, но если не выходит и после нескольких
+            // попыток, дело всё-таки может быть в нём.
             self.next_server(current.as_ref())
         } else {
             current
@@ -772,11 +1359,131 @@ impl Supervisor {
         }
     }
 
+    /// Запоминает падение, объявляет его и возвращает, на кого переходить.
+    ///
+    /// Объявление — отдельное событие, а не строчка в журнале: смена состояния
+    /// на «переподключаюсь» не говорит, какой сервер выбыл и почему демон
+    /// оказался на другом. Восстановить это потом неоткуда.
+    fn note_failure(&mut self, failed: &ProfileId, cause: &ReconnectCause) -> Option<ProfileId> {
+        self.failed_servers.insert(failed.clone(), Instant::now());
+
+        let replacement = self.best_replacement(failed);
+        let rtt = replacement
+            .as_ref()
+            .and_then(|id| self.probes.get(id))
+            .and_then(|p| p.rtt_ms);
+
+        tracing::warn!(
+            server = %failed,
+            replacement = replacement.as_ref().map(|id| id.to_string()),
+            rtt_ms = rtt,
+            ?cause,
+            "сервер выбыл"
+        );
+
+        self.emit(Event::ServerFailed(sont_ipc::ServerFailure {
+            name: self
+                .servers
+                .iter()
+                .find(|s| &s.id == failed)
+                .map_or_else(|| failed.to_string(), |s| s.name.clone()),
+            server: failed.clone(),
+            cause: cause.clone(),
+            switching_to: replacement.clone(),
+            switching_to_rtt_ms: rtt,
+        }));
+
+        // Замены нет — остаёмся на упавшем: единственный сервер подписки
+        // лучше, чем отказ от попыток вообще.
+        replacement.or_else(|| Some(failed.clone()))
+    }
+
+    /// Лучший по замеру сервер на замену упавшему.
+    ///
+    /// Именно лучший, а не следующий по списку: пользователь остался без сети,
+    /// и вести его на случайный сервер, когда известно, какой отвечает быстрее
+    /// всех, — значит выбирать худшее из доступного.
+    ///
+    /// Недавно упавшие исключаются. Если исключить пришлось всех — берём и их:
+    /// сервер, лежавший десять минут назад, всё-таки лучше, чем отказ
+    /// подключаться вообще.
+    fn best_replacement(&self, failed: &ProfileId) -> Option<ProfileId> {
+        let fresh: Vec<&ServerProfile> = self
+            .candidates()
+            .filter(|s| &s.id != failed)
+            .filter(|s| !self.recently_failed(&s.id))
+            .collect();
+
+        if !fresh.is_empty() {
+            return self.best_of(fresh);
+        }
+
+        tracing::warn!("все серверы недавно падали, пробую их заново");
+        let retry: Vec<&ServerProfile> = self.candidates().filter(|s| &s.id != failed).collect();
+        self.best_of(retry)
+    }
+
+    /// Лучший по замеру сервер, кроме указанного.
+    fn best_by_probe(&self, except: Option<&ProfileId>) -> Option<ProfileId> {
+        let pool: Vec<&ServerProfile> = self
+            .candidates()
+            .filter(|s| except.is_none_or(|id| &s.id != id))
+            .collect();
+        self.best_of(pool)
+    }
+
+    fn best_of(&self, pool: Vec<&ServerProfile>) -> Option<ProfileId> {
+        pool.into_iter()
+            .min_by_key(|s| {
+                self.probes
+                    .get(&s.id)
+                    // Неизмеренный сервер хуже любого измеренного и отвечающего,
+                    // но лучше измеренного и молчащего: про него хотя бы ничего
+                    // плохого не известно.
+                    .map_or(u32::MAX - 1, ProbeResult::score)
+            })
+            .map(|s| s.id.clone())
+    }
+
+    /// Серверы, среди которых вообще имеет смысл выбирать.
+    ///
+    /// Единственное место, где применяется фильтр по предпочитаемым
+    /// протоколам: разложи его по трём функциям выбора — и они разойдутся,
+    /// а пользователь получит «подключаюсь по тому протоколу, который
+    /// запретил», причём только в одном из сценариев.
+    ///
+    /// Пустой список предпочтений означает «все», а не «ни одного».
+    fn candidates(&self) -> impl Iterator<Item = &ServerProfile> {
+        let preferred = &self.settings.preferred_transports;
+
+        // Предпочтение, не оставившее ни одного сервера, игнорируется.
+        //
+        // Отказать в подключении, потому что в подписке нет любимого
+        // протокола, значит оставить пользователя без сети ради настройки,
+        // которую он трактовал как «лучше вот так», а не как «иначе не
+        // подключаться».
+        let usable = preferred.is_empty()
+            || !self
+                .servers
+                .iter()
+                .any(|s| preferred.contains(&s.transport.kind()));
+
+        self.servers
+            .iter()
+            .filter(move |s| usable || preferred.contains(&s.transport.kind()))
+    }
+
+    fn recently_failed(&self, id: &ProfileId) -> bool {
+        self.failed_servers
+            .get(id)
+            .is_some_and(|at| at.elapsed() < FAILED_SERVER_COOLDOWN)
+    }
+
     /// Следующий сервер по качеству после указанного.
     ///
     /// Перебор по кругу: дойдя до конца списка, возвращаемся к лучшему.
     fn next_server(&self, after: Option<&ProfileId>) -> Option<ProfileId> {
-        let mut ranked: Vec<&ServerProfile> = self.servers.iter().collect();
+        let mut ranked: Vec<&ServerProfile> = self.candidates().collect();
         ranked.sort_by_key(|s| {
             self.probes
                 .get(&s.id)
@@ -795,9 +1502,19 @@ impl Supervisor {
     /// Используется там, где повторять попытку заведомо бесполезно: демон
     /// перестаёт бороться, а пользователь получает причину.
     fn fail(&mut self, error: TunnelError) {
-        let blocked = self.settings.firewall.survives_daemon_crash();
         self.desired = Desired::Disconnected;
         self.reconnect_attempt = 0;
+
+        // В режиме lockdown блокировка остаётся: соединение не поднялось,
+        // и открыть трафик значило бы выпустить его мимо туннеля — ровно то,
+        // что пользователь запретил. В `Auto` фильтры снимаются: там договор
+        // другой — защищать перерыв в соединении, а не держать машину без
+        // сети после того, как демон сдался.
+        if !self.settings.firewall.survives_daemon_crash() {
+            self.disengage_firewall();
+        }
+
+        let blocked = self.firewall.is_some();
         self.set_state(TunnelState::Failed { error, blocked });
     }
 
@@ -909,30 +1626,53 @@ impl Supervisor {
                     );
                     // Всё поднятое отменённой попыткой нужно погасить, иначе
                     // маршруты останутся указывать в брошенный туннель.
-                    if let Ok(started) = result {
+                    if let Ok(started) = *result {
                         tokio::spawn(shutdown_started(started));
                     }
                     return;
                 }
 
-                match result {
+                match *result {
                     Ok(started) => {
                         let Some(server) = self.state.server().cloned() else {
                             tokio::spawn(shutdown_started(started));
                             return;
                         };
                         tracing::info!(pid = started.core.pid(), "туннель поднят");
+
+                        // Адреса берём у поднявшегося ядра, а не у собственных
+                        // предположений: только оно знает, какие порты ему в
+                        // итоге достались.
+                        self.metrics_url =
+                            Some(format!("http://{}/debug/vars", started.runtime.metrics_listen));
+                        self.proxy = Some(sont_ipc::ProxyEndpoints {
+                            http: started.runtime.http_listen.clone(),
+                            socks: started.runtime.probe_listen.clone(),
+                        });
+
                         self.active = Some(started);
                         // Соединение состоялось — счётчики надзора начинаются
                         // заново, иначе следующий обрыв унаследует длинную
                         // паузу от прошлых неудач.
                         self.reconnect_attempt = 0;
+                        // И отметку о падении снимаем: сервер только что
+                        // доказал, что работает, а держать его в опале по
+                        // старой памяти значит обходить рабочий сервер.
+                        self.failed_servers.remove(&server);
                         self.health_failures = 0;
                         self.last_health_check = Instant::now();
+
+                        let tun = tun_info();
+                        // Только теперь у блокировки появляется то, ради чего
+                        // она вообще пропускает трафик: адаптер туннеля.
+                        // Правила переставляются на месте, не открывая доступ
+                        // ни на мгновение.
+                        self.sync_firewall(tun.luid);
+
                         self.set_state(TunnelState::Connected {
                             server,
                             since_unix_ms: now_unix_ms(),
-                            tun: tun_info(&self.settings),
+                            tun,
                         });
                     }
                     Err(error) => {
@@ -952,7 +1692,7 @@ impl Supervisor {
                 }
             }
 
-            Internal::SubscriptionFetched(result) => self.apply_fetched(result),
+            Internal::SubscriptionFetched { id, result } => self.apply_fetched(id, result),
 
             Internal::CoreVersion(version) => {
                 match &version {
@@ -963,6 +1703,8 @@ impl Supervisor {
             }
 
             Internal::CoreStats(counters) => self.apply_counters(counters),
+
+            Internal::Probed(results) => self.apply_probes(results),
 
             Internal::HealthChecked { generation, alive } => {
                 // Результат проверки от прошлого сеанса ничего не говорит о
@@ -981,6 +1723,7 @@ impl Supervisor {
                 let reason = self.pending_reason.take();
                 // Явное отключение снимает блокировку даже в режиме lockdown:
                 // пользователь сам попросил вернуть прямой доступ.
+                self.disengage_firewall();
                 self.set_state(TunnelState::Disconnected {
                     reason,
                     blocked: false,
@@ -992,7 +1735,7 @@ impl Supervisor {
     /// Выбирает сервер: явный → закреплённый → лучший по замерам.
     fn select_server(&self, explicit: Option<ProfileId>) -> Result<ProfileId, TunnelError> {
         if self.servers.is_empty() {
-            return Err(if self.subscription_secret.is_none() {
+            return Err(if self.subscriptions.is_empty() {
                 TunnelError::NoSubscription
             } else {
                 TunnelError::NoUsableServers
@@ -1020,15 +1763,7 @@ impl Supervisor {
             }
         }
 
-        self.servers
-            .iter()
-            .min_by_key(|s| {
-                self.probes
-                    .get(&s.id)
-                    .map_or(u32::MAX - 1, ProbeResult::score)
-            })
-            .map(|s| s.id.clone())
-            .ok_or(TunnelError::NoUsableServers)
+        self.best_by_probe(None).ok_or(TunnelError::NoUsableServers)
     }
 
     fn set_state(&mut self, state: TunnelState) {
@@ -1037,7 +1772,106 @@ impl Supervisor {
         }
         tracing::info!(from = self.state.kind(), to = state.kind(), "смена состояния");
         self.state = state.clone();
+        // Машинную настройку правим до рассылки события, а не после: пусть
+        // к моменту, когда клиенты узнали о смене состояния, система уже знает
+        // адрес. Порядок здесь тот же, что и для пользовательских настроек, и
+        // по той же причине — окно, в котором адрес не объявлен, приложения
+        // используют, чтобы уйти напрямую.
+        self.sync_machine_proxy();
         self.emit(Event::StateChanged(state));
+    }
+
+    /// Обрывает установленные соединения, чтобы они переехали на прокси.
+    ///
+    /// Настройка прокси действует только на новые соединения, а открытые живут
+    /// часами — и приложение продолжает ходить напрямую при формально
+    /// включённом VPN. В режиме туннеля этого не случается: подъём адаптера
+    /// меняет маршрут, и прежние соединения рвутся сами. Здесь делаем то же
+    /// самое явно. Подробности отбора — в [`crate::connections`].
+    fn reset_connections_after_announcement(&mut self) {
+        if !matches!(self.settings.mode, sont_core::ConnectionMode::Proxy) {
+            return;
+        }
+        if !self.state.is_connected() {
+            return;
+        }
+
+        let mut protect = crate::connections::Protected {
+            // Свои процессы: оборвать связь ядра с сервером — обрушить туннель,
+            // ради которого всё и делается.
+            pids: vec![std::process::id()],
+            addresses: Vec::new(),
+        };
+        if let Some(pid) = self.active.as_ref().and_then(|a| a.core.pid()) {
+            protect.pids.push(pid);
+        }
+        // Адрес сервера, если он записан литералом. Для доменного имени
+        // хватает защиты по процессу — резолвить здесь ради этого незачем.
+        if let Some(server) = self.state.server() {
+            if let Some(profile) = self.servers.iter().find(|s| &s.id == server) {
+                if let Ok(std::net::IpAddr::V4(ip)) = profile.endpoint.host.parse() {
+                    protect.addresses.push(ip);
+                }
+            }
+        }
+
+        let reset = crate::connections::reset_established(&protect);
+        if reset > 0 {
+            tracing::info!(
+                count = reset,
+                "соединения оборваны — приложения переоткроют их через прокси"
+            );
+        } else {
+            tracing::debug!("обрывать нечего или не хватило прав");
+        }
+    }
+
+    /// Какой адрес должна знать машинная настройка прямо сейчас.
+    ///
+    /// Условия те же, по которым адрес отдаётся клиентам: режим прокси и
+    /// удерживаемый путь. Разъехавшись, две настройки указывали бы на разное,
+    /// и часть приложений ходила бы через прокси, а часть мимо — причём
+    /// понять, какая именно, стало бы невозможно.
+    fn desired_machine_proxy(&self) -> Option<String> {
+        if !matches!(self.settings.mode, sont_core::ConnectionMode::Proxy) {
+            return None;
+        }
+        if !self.state.holds_a_route() {
+            return None;
+        }
+        self.proxy.as_ref().map(|p| p.http.clone())
+    }
+
+    /// Приводит машинную настройку WinHTTP в соответствие с состоянием.
+    ///
+    /// Делает это демон, а не агент: настройка лежит в `HKLM`, и прав на неё у
+    /// непривилегированного процесса нет. Пользовательские настройки, наоборот,
+    /// демону недоступны — отсюда и разделение, описанное в [`crate::winhttp`].
+    fn sync_machine_proxy(&mut self) {
+        let desired = self.desired_machine_proxy();
+
+        if desired == self.machine_proxy {
+            return;
+        }
+
+        let outcome = match &desired {
+            Some(http) => crate::winhttp::apply(http),
+            None => crate::winhttp::clear(),
+        };
+
+        match outcome {
+            Ok(()) => {
+                match &desired {
+                    Some(http) => tracing::info!(%http, "машинный прокси WinHTTP объявлен"),
+                    None => tracing::info!("машинный прокси WinHTTP снят"),
+                }
+                self.machine_proxy = desired;
+            }
+            // Не отказ соединения: без прав администратора настройка недоступна,
+            // но всё остальное — пользовательские настройки, переменные
+            // окружения — работает и без неё.
+            Err(e) => tracing::warn!(error = %e, "не удалось изменить машинный прокси WinHTTP"),
+        }
     }
 
     /// Запрашивает у ядра свежие счётчики.
@@ -1100,11 +1934,18 @@ impl Supervisor {
         StatusSnapshot {
             state: self.state.clone(),
             stats: self.stats,
-            subscription: self.subscription.clone(),
+            subscriptions: self.subscription_statuses(),
             server_count: self.servers.len() as u32,
-            // Адреса отдаём только пока соединение действительно поднято:
-            // иначе клиент пропишет в систему прокси, за которым никого нет.
-            proxy: self.state.is_connected().then(|| self.proxy.clone()).flatten(),
+            // Адреса отдаём и на время переподключения, а не только по факту
+            // соединения.
+            //
+            // На эти секунды прокси действительно не отвечает, и это
+            // осознанная плата. Обратный порядок хуже: пока адрес не объявлен,
+            // приложения переустанавливают соединения напрямую и остаются так
+            // надолго — открытые сокеты на появившийся прокси не переносятся.
+            // Отказ в соединении приложение переживает повтором, молчаливый
+            // обход VPN — нет.
+            proxy: self.state.holds_a_route().then(|| self.proxy.clone()).flatten(),
         }
     }
 
@@ -1226,7 +2067,11 @@ async fn start_core(
             socks = %runtime.probe_listen,
             "режим прокси: сетевой слой не поднимается"
         );
-        return Ok(Started { core, tunnel: None });
+        return Ok(Started {
+            core,
+            tunnel: None,
+            runtime: runtime.clone(),
+        });
     }
 
     // ── Этап 2: поднимаем сетевой слой ────────────────────────────────
@@ -1271,6 +2116,7 @@ async fn start_core(
         Ok(()) => Ok(Started {
             core,
             tunnel: Some(tunnel),
+            runtime: runtime.clone(),
         }),
         Err(e) => {
             // Порядок обратный запуску: сначала снимаем маршруты, потом
@@ -1287,6 +2133,12 @@ pub struct Started {
     pub core: CoreProcess,
     /// `None` в режиме прокси: там адаптер не создаётся.
     pub tunnel: Option<crate::tunnel::Tunnel>,
+    /// Адреса, на которых слушает именно это ядро.
+    ///
+    /// Возвращаются наружу, а не выбираются заранее: пока прежняя сессия не
+    /// остановлена, её порты заняты, и выбранный до остановки номер оказался
+    /// бы случайным. См. [`Supervisor::launch`].
+    pub runtime: sont_xray::RuntimeInfo,
 }
 
 /// Останавливает всё поднятое, соблюдая порядок.
@@ -1566,22 +2418,128 @@ async fn log_default_routes() {
     }
 }
 
+/// Читает подписки с диска, при необходимости перенося прежнюю раскладку.
+///
+/// Перенос не роскошь: ключ подписки — это платный доступ пользователя,
+/// который он вводил вручную. Потерять его из-за того, что у нас поменялась
+/// структура файлов, недопустимо.
+fn load_subscriptions(config: &SupervisorConfig) -> Vec<SubscriptionEntry> {
+    if let Some(entries) = secrets::load_json::<Vec<SubscriptionEntry>>(&config.subscriptions_path) {
+        return entries;
+    }
+
+    let migrated = migrate_single_subscription(config);
+    if migrated.is_empty() {
+        return migrated;
+    }
+
+    tracing::info!("подписка перенесена в новый формат хранения");
+    if let Err(e) = secrets::store_json(&config.subscriptions_path, &migrated) {
+        // Не теряем то, что уже прочитали: в этот запуск подписка работает, а
+        // старые файлы остаются на месте и попробуем снова при следующем.
+        tracing::error!(error = %e, "не удалось сохранить перенесённую подписку");
+        return migrated;
+    }
+
+    // Старое убираем только после успешной записи нового — иначе неудачная
+    // запись оставила бы пользователя вообще без ключа.
+    let _ = secrets::clear(&config.legacy_subscription_path);
+    let _ = secrets::clear(&config.legacy_servers_cache_path);
+
+    migrated
+}
+
+/// Собирает запись из файлов прежней раскладки.
+fn migrate_single_subscription(config: &SupervisorConfig) -> Vec<SubscriptionEntry> {
+    let secret = match secrets::load(&config.legacy_subscription_path) {
+        Ok(Some(secret)) => secret,
+        Ok(None) => return Vec::new(),
+        Err(e) => {
+            tracing::error!(error = %e, "не удалось прочитать сохранённый ключ подписки");
+            return Vec::new();
+        }
+    };
+
+    // Разобранные серверы могли и не сохраниться — тогда запись всё равно
+    // осмысленна: ключ есть, серверы придут с первым обновлением.
+    let cached = secrets::load_json::<LegacyCachedSubscription>(&config.legacy_servers_cache_path);
+
+    let id = SubscriptionId::from_url(secret.expose());
+    vec![SubscriptionEntry {
+        masked_url: secret.masked(),
+        profiles: cached
+            .as_ref()
+            .filter(|c| c.id == id)
+            .map(|c| c.profiles.clone())
+            .unwrap_or_default(),
+        info: cached
+            .filter(|c| c.id == id)
+            .map(|c| c.info)
+            .unwrap_or_default(),
+        id,
+        secret,
+    }]
+}
+
+/// Виноват ли в переподключении сам сервер.
+///
+/// Различие определяет, менять ли сервер. Упавшее ядро и молчащий туннель —
+/// это про сервер. Пропавшая сеть и выход из сна — про машину: на другом
+/// сервере они повторятся один в один, а пользователь получит смену адреса
+/// вместо соединения.
+fn server_at_fault(cause: &ReconnectCause) -> bool {
+    match cause {
+        ReconnectCause::CoreExited { .. } | ReconnectCause::HealthCheckFailed { .. } => true,
+        ReconnectCause::NetworkChanged
+        | ReconnectCause::SystemResumed
+        | ReconnectCause::ServerSwitched
+        // Смена настроек тем более не вина сервера: он исправен, просто
+        // конфигурация ядра собрана по старым значениям.
+        | ReconnectCause::Reconfigured
+        // Переход на более быстрый сервер — не отказ текущего: он работает,
+        // просто нашёлся лучше. Записать его в упавшие значило бы посадить
+        // рабочий сервер в штрафной ящик на десять минут.
+        | ReconnectCause::BetterServerFound { .. } => false,
+    }
+}
+
+/// Общий список серверов из всех подписок.
+///
+/// Порядок подписок задаёт приоритет: сервер, встретившийся в двух, берётся из
+/// той, что добавлена раньше. Дубликаты по `id` — не редкость: панели
+/// перепродают одни и те же узлы, а id считается от адреса и учётных данных.
+fn merge_servers(subscriptions: &[SubscriptionEntry]) -> Vec<ServerProfile> {
+    let mut seen: HashSet<ProfileId> = HashSet::new();
+    let mut servers = Vec::new();
+
+    for entry in subscriptions {
+        for profile in &entry.profiles {
+            if seen.insert(profile.id.clone()) {
+                servers.push(profile.clone());
+            }
+        }
+    }
+
+    servers
+}
+
 fn runtime_info(settings: &Settings) -> sont_xray::RuntimeInfo {
     sont_xray::RuntimeInfo {
         log_level: settings.log_level.clone(),
-        // Служебные порты берём свободные: их адреса живут внутри демона, и
-        // фиксированный номер породил бы конфликт при быстром переподключении,
-        // когда прежний экземпляр ядра ещё не освободил сокет.
+        // Служебный порт статистики наружу не объявляется: его адрес живёт
+        // внутри демона, и постоянство ему ни к чему.
         metrics_listen: format!("127.0.0.1:{}", pick_free_port()),
-        probe_listen: format!("127.0.0.1:{}", pick_free_port()),
-        // HTTP-порт стараемся держать постоянным, но не любой ценой.
+        // А вот адреса прокси пользователь видит и настраивает по ним
+        // приложения — их держим постоянными, насколько это возможно.
         //
-        // Постоянство удобно: адрес прописан в настройках прокси Windows и не
-        // меняется при переподключении. Но если порт занят — другим клиентом
-        // или собственным подвисшим ядром, — упереться в это и вовсе не
-        // подключиться было бы хуже. Агент в сеансе пользователя переприменяет
-        // настройки при каждой смене состояния, поэтому смену порта система
-        // переживает без потерь.
+        // Вызывать эту функцию следует только после остановки прежнего ядра:
+        // иначе предпочитаемые порты заняты им же, и «постоянные» адреса
+        // меняются на каждом переподключении.
+        probe_listen: format!("127.0.0.1:{}", preferred_or_free_port(PREFERRED_SOCKS_PORT)),
+        // Если порт занят кем-то посторонним — берём любой свободный: упереться
+        // в это и вовсе не подключиться было бы хуже. Агент в сеансе
+        // пользователя переприменяет настройки при каждой смене состояния,
+        // поэтому смену порта система переживает.
         http_listen: format!("127.0.0.1:{}", preferred_or_free_port(PREFERRED_HTTP_PORT)),
         ..Default::default()
     }
@@ -1595,6 +2553,8 @@ fn runtime_info(settings: &Settings) -> sont_xray::RuntimeInfo {
 /// номер порождал бы конфликт при каждом повторном подключении.
 /// Предпочитаемый порт локального HTTP-прокси.
 const PREFERRED_HTTP_PORT: u16 = 18966;
+/// Предпочитаемый порт локального SOCKS.
+const PREFERRED_SOCKS_PORT: u16 = 18965;
 
 /// Возвращает предпочитаемый порт, если он свободен, иначе любой свободный.
 fn preferred_or_free_port(preferred: u16) -> u16 {
@@ -1618,8 +2578,15 @@ fn pick_free_port() -> u16 {
         .unwrap_or(18964)
 }
 
-fn tun_info(settings: &Settings) -> TunInfo {
-    let runtime = runtime_info(settings);
+/// Что сообщить клиентам о сетевом адаптере.
+///
+/// Имя и MTU берутся из умолчаний ядра. Портов эта функция не касается
+/// намеренно: раньше она собирала полный `RuntimeInfo` и на каждом переходе в
+/// «подключено» занимала и отпускала три сокета — попутно записывая в журнал
+/// «предпочитаемый порт занят» про порт, который сама же и заняла, и сообщая
+/// клиентам номера, не имеющие отношения к работающему ядру.
+fn tun_info() -> TunInfo {
+    let runtime = sont_xray::RuntimeInfo::default();
     TunInfo {
         name: runtime.tun_name,
         // Индекс и LUID интерфейса понадобятся слою firewall в фазе 4;
@@ -1673,10 +2640,11 @@ mod tests {
     fn core_started(generation: u64) -> Internal {
         Internal::CoreStarted {
             generation,
-            result: Ok(Started {
+            result: Box::new(Ok(Started {
                 core: CoreProcess::placeholder(),
                 tunnel: Some(crate::tunnel::Tunnel::placeholder()),
-            }),
+                runtime: sont_xray::RuntimeInfo::default(),
+            })),
         }
     }
 
@@ -1689,8 +2657,9 @@ mod tests {
                 demo_servers,
                 settings_path: dir.path().join("settings.json"),
                 favorites_path: dir.path().join("favorites.json"),
-                subscription_path: dir.path().join("subscription.bin"),
-                servers_cache_path: dir.path().join("servers.bin"),
+                subscriptions_path: dir.path().join("subscriptions.bin"),
+                legacy_subscription_path: dir.path().join("subscription.bin"),
+                legacy_servers_cache_path: dir.path().join("servers.bin"),
                 core_binary: dir.path().join("xray-отсутствует.exe"),
                 core_config_path: dir.path().join("xray-config.json"),
             },
@@ -1726,6 +2695,180 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconnecting_while_connected_hands_off_the_previous_session() {
+        // Типичный путь применить смену режима — переподключиться, не
+        // отключаясь явно. Прежнюю сессию (процесс ядра, TUN-адаптер) нельзя
+        // просто забыть: `CoreProcess` и `Tunnel` не останавливаются в
+        // `Drop`, и она осталась бы висеть — снять её после этого нечем.
+        let (mut sup, _dir) = make(true);
+
+        sup.handle(Request::Connect { server: None });
+        let g1 = sup.generation;
+        sup.handle_internal(core_started(g1));
+        assert!(sup.active.is_some());
+
+        sup.handle(Request::Connect { server: None });
+        assert!(
+            sup.active.is_none(),
+            "прежняя сессия должна уйти на остановку, а не быть заброшенной"
+        );
+
+        let g2 = sup.generation;
+        assert_ne!(g1, g2, "повторное подключение обязано начать новое поколение");
+        sup.handle_internal(core_started(g2));
+        assert!(sup.active.is_some());
+    }
+
+    /// Переводит настройки в режим прокси.
+    fn set_proxy_mode(sup: &mut Supervisor) {
+        sup.handle(Request::PatchSettings {
+            patch: sont_core::SettingsPatch {
+                mode: Some(sont_core::ConnectionMode::Proxy),
+                ..Default::default()
+            },
+        });
+    }
+
+    #[tokio::test]
+    async fn machine_proxy_follows_the_same_rule_as_the_user_one() {
+        // Настроек прокси в Windows три, и читают их разные семейства
+        // программ. Разъедься они — часть приложений пойдёт через прокси, а
+        // часть мимо, и понять, какая именно, будет невозможно.
+        let (mut sup, _dir) = make(true);
+        set_proxy_mode(&mut sup);
+
+        // Пути ещё нет — объявлять нечего.
+        assert_eq!(sup.desired_machine_proxy(), None);
+
+        sup.handle(Request::Connect { server: None });
+        sup.handle_internal(core_started(sup.generation));
+
+        let announced = sup.desired_machine_proxy();
+        assert_eq!(
+            announced.as_deref(),
+            sup.snapshot().proxy.as_ref().map(|p| p.http.as_str()),
+            "машинная и пользовательская настройки обязаны знать один адрес"
+        );
+        assert!(announced.is_some());
+    }
+
+    #[tokio::test]
+    async fn machine_proxy_is_not_announced_in_tunnel_mode() {
+        // В туннеле трафик идёт через адаптер, и лишняя настройка только
+        // заставит службы ходить через прокси поверх туннеля.
+        let (mut sup, _dir) = make(true);
+        sup.handle(Request::Connect { server: None });
+        sup.handle_internal(core_started(sup.generation));
+
+        assert!(sup.state.is_connected());
+        assert_eq!(sup.desired_machine_proxy(), None);
+    }
+
+    #[tokio::test]
+    async fn machine_proxy_is_taken_back_on_disconnect() {
+        // Оставленный машинный адрес ломает обновления системы, и связать это
+        // с выключенным накануне VPN пользователь не сможет.
+        let (mut sup, _dir) = make(true);
+        set_proxy_mode(&mut sup);
+        sup.handle(Request::Connect { server: None });
+        sup.handle_internal(core_started(sup.generation));
+        assert!(sup.desired_machine_proxy().is_some());
+
+        sup.handle(Request::Disconnect);
+        assert_eq!(sup.desired_machine_proxy(), None);
+    }
+
+    #[tokio::test]
+    async fn machine_proxy_survives_a_reconnect() {
+        // Ровно то же требование, что и к пользовательской настройке: снятый
+        // на время переподключения адрес — это окно, в которое приложения
+        // уходят напрямую и там остаются.
+        let (mut sup, _dir) = make(true);
+        set_proxy_mode(&mut sup);
+        sup.handle(Request::Connect { server: None });
+        sup.handle_internal(core_started(sup.generation));
+        let during = sup.desired_machine_proxy();
+
+        sup.handle(Request::Connect { server: None });
+        assert_eq!(sup.desired_machine_proxy(), during);
+    }
+
+    #[tokio::test]
+    async fn proxy_addresses_survive_a_reconnect() {
+        // Самое важное свойство режима прокси: адрес объявлен непрерывно.
+        //
+        // Стоит перестать объявлять его на время переподключения — и в это
+        // окно приложения переустановят соединения напрямую. Обратно на
+        // прокси они уже не вернутся: открытые сокеты никто не переносит, а
+        // HTTP/2 и WebSocket живут часами.
+        let (mut sup, _dir) = make(true);
+
+        sup.handle(Request::Connect { server: None });
+        sup.handle_internal(core_started(sup.generation));
+        let during_connection = sup.snapshot().proxy;
+        assert!(during_connection.is_some());
+
+        // Переподключение: ядро упало и поднимается заново.
+        sup.handle(Request::Connect { server: None });
+        assert_eq!(
+            sup.snapshot().proxy,
+            during_connection,
+            "на время переподключения адрес прокси обязан оставаться объявленным"
+        );
+    }
+
+    #[tokio::test]
+    async fn disconnecting_takes_the_proxy_address_back() {
+        // Обратное тоже обязано работать: адрес, за которым больше никого не
+        // будет, для пользователя выглядит как полностью пропавший интернет.
+        let (mut sup, _dir) = make(true);
+
+        sup.handle(Request::Connect { server: None });
+        sup.handle_internal(core_started(sup.generation));
+        assert!(sup.snapshot().proxy.is_some());
+
+        sup.handle(Request::Disconnect);
+        assert_eq!(
+            sup.snapshot().proxy,
+            None,
+            "после команды отключения адрес объявлять нечем"
+        );
+    }
+
+    #[tokio::test]
+    async fn proxy_addresses_are_published_only_after_the_core_reports_them() {
+        // Порты выбирает фоновая задача — уже после остановки прежней сессии,
+        // иначе предпочитаемые номера заняты ею же. Значит, до готовности ядра
+        // адресов попросту нет, и выдавать предполагаемые нельзя: клиент
+        // пропишет в настройки системы порт, который ядру мог и не достаться.
+        let (mut sup, _dir) = make(true);
+
+        sup.handle(Request::Connect { server: None });
+        assert!(
+            sup.proxy.is_none(),
+            "во время подключения адреса ядра ещё неизвестны"
+        );
+
+        let generation = sup.generation;
+        sup.handle_internal(core_started(generation));
+
+        let expected = sont_xray::RuntimeInfo::default();
+        let proxy = sup.proxy.clone().expect("после старта адреса обязаны быть");
+        assert_eq!(proxy.http, expected.http_listen);
+        assert_eq!(proxy.socks, expected.probe_listen);
+        assert_eq!(
+            sup.metrics_url.as_deref(),
+            Some(format!("http://{}/debug/vars", expected.metrics_listen).as_str()),
+        );
+    }
+
+    #[test]
+    fn preferred_proxy_ports_do_not_collide() {
+        // Оба входа поднимает одно ядро: совпади номера — оно не стартует.
+        assert_ne!(PREFERRED_HTTP_PORT, PREFERRED_SOCKS_PORT);
+    }
+
+    #[tokio::test]
     async fn stale_connect_result_does_not_resurrect_cancelled_session() {
         // Пользователь нажал «подключить», передумал и нажал «отключить»
         // раньше, чем туннель поднялся. Запоздавший результат первой попытки
@@ -1748,6 +2891,92 @@ mod tests {
         let current = sup.generation;
         sup.handle_internal(Internal::DisconnectFinished { generation: current });
         assert_eq!(sup.state.kind(), "disconnected");
+    }
+
+    #[tokio::test]
+    async fn failure_does_not_claim_a_block_that_does_not_exist() {
+        // Состояние сообщает о блокировке только тогда, когда фильтры
+        // действительно стоят. Здесь до подключения дело не дошло, ставить
+        // их было некому — и «трафик заблокирован» отправило бы пользователя
+        // искать несуществующую блокировку вместо настоящей причины отказа.
+        let (mut sup, _dir) = make(true);
+        sup.settings.firewall = FirewallMode::Lockdown;
+
+        sup.fail(TunnelError::NoUsableServers);
+
+        assert_eq!(sup.state.kind(), "failed");
+        assert!(
+            !sup.state.is_blocked(),
+            "объявлена блокировка, которой нечем удержать"
+        );
+    }
+
+    #[tokio::test]
+    async fn lockdown_keeps_the_block_after_a_failure() {
+        // Соединение не поднялось, а трафик всё равно закрыт — в этом и
+        // смысл режима: выпустить его напрямую значило бы сделать ровно то,
+        // что пользователь запретил.
+        let (mut sup, _dir) = make(true);
+        sup.settings.firewall = FirewallMode::Lockdown;
+
+        sup.handle(Request::Connect { server: None });
+        assert!(sup.firewall.is_some(), "фильтры ставятся до запуска ядра");
+
+        sup.fail(TunnelError::NoUsableServers);
+
+        assert_eq!(sup.state.kind(), "failed");
+        assert!(sup.state.is_blocked(), "lockdown обязан удержать блокировку");
+    }
+
+    #[tokio::test]
+    async fn auto_mode_opens_the_traffic_when_the_daemon_gives_up() {
+        // Договор `Auto` другой: защищать перерыв в соединении, а не держать
+        // машину без сети после того, как демон перестал бороться.
+        let (mut sup, _dir) = make(true);
+        sup.settings.firewall = FirewallMode::Auto;
+
+        sup.handle(Request::Connect { server: None });
+        assert!(sup.firewall.is_some());
+
+        sup.fail(TunnelError::NoUsableServers);
+
+        assert!(sup.firewall.is_none(), "фильтры остались висеть");
+        assert!(!sup.state.is_blocked());
+    }
+
+    #[tokio::test]
+    async fn turning_the_kill_switch_off_lifts_the_block() {
+        let (mut sup, _dir) = make(true);
+        sup.settings.firewall = FirewallMode::Lockdown;
+        sup.handle(Request::Connect { server: None });
+        assert!(sup.firewall.is_some());
+
+        sup.handle(Request::PatchSettings {
+            patch: sont_core::SettingsPatch {
+                firewall: Some(FirewallMode::Off),
+                ..Default::default()
+            },
+        });
+
+        assert!(sup.firewall.is_none(), "выключенный kill-switch продолжает блокировать");
+    }
+
+    #[tokio::test]
+    async fn the_kill_switch_does_not_cut_the_net_of_a_disconnected_user() {
+        // Пользователь отключён и включает блокировку «на будущее». Ставить
+        // фильтры прямо сейчас значило бы отрезать ему сеть настройкой,
+        // которая должна была её всего лишь защитить.
+        let (mut sup, _dir) = make(true);
+
+        sup.handle(Request::PatchSettings {
+            patch: sont_core::SettingsPatch {
+                firewall: Some(FirewallMode::Lockdown),
+                ..Default::default()
+            },
+        });
+
+        assert!(sup.firewall.is_none());
+        assert!(!sup.state.is_blocked());
     }
 
     #[tokio::test]
@@ -1849,17 +3078,377 @@ mod tests {
         assert!(views[0].favorite);
     }
 
+    /// Подключает демон и доводит до «подключено».
+    fn connect_to(sup: &mut Supervisor, server: &ProfileId) {
+        sup.handle(Request::Connect {
+            server: Some(server.clone()),
+        });
+        sup.handle_internal(core_started(sup.generation));
+        assert_eq!(sup.state.server(), Some(server));
+    }
+
+    /// Расставляет замеры: чем дальше по списку, тем хуже.
+    fn set_probes(sup: &mut Supervisor, rtts: &[(usize, u32)]) {
+        let ids: Vec<ProfileId> = sup.servers.iter().map(|s| s.id.clone()).collect();
+        for (index, rtt) in rtts {
+            sup.probes.insert(
+                ids[*index].clone(),
+                ProbeResult {
+                    server: ids[*index].clone(),
+                    rtt_ms: Some(*rtt),
+                    loss_percent: 0,
+                    measured_at_unix_ms: 0,
+                },
+            );
+        }
+    }
+
+    /// Кладёт замеры и сообщает их супервизору так, как это делает фоновая
+    /// задача, — чтобы проверялся весь путь, а не только выбор.
+    fn report_probes(sup: &mut Supervisor, rtts: &[(usize, u32)]) {
+        let ids: Vec<ProfileId> = sup.servers.iter().map(|s| s.id.clone()).collect();
+        let results = rtts
+            .iter()
+            .map(|(index, rtt)| ProbeResult {
+                server: ids[*index].clone(),
+                rtt_ms: Some(*rtt),
+                loss_percent: 0,
+                measured_at_unix_ms: 0,
+            })
+            .collect();
+        sup.handle_internal(Internal::Probed(results));
+    }
+
+    #[tokio::test]
+    async fn preferred_protocols_narrow_the_choice() {
+        // Настройка существовала и сохранялась, но на выбор не влияла вовсе:
+        // пользователь запрещал протокол и всё равно подключался по нему.
+        use sont_core::TransportKind;
+
+        let (mut sup, _dir) = make(true);
+        let ss = sup
+            .servers
+            .iter()
+            .find(|s| s.transport.kind() == TransportKind::Shadowsocks)
+            .expect("в демо-наборе должен быть Shadowsocks")
+            .id
+            .clone();
+
+        // Пусть Shadowsocks окажется худшим по замеру — предпочтение обязано
+        // перевесить.
+        let ids: Vec<ProfileId> = sup.servers.iter().map(|s| s.id.clone()).collect();
+        for (i, id) in ids.iter().enumerate() {
+            sup.probes.insert(
+                id.clone(),
+                ProbeResult {
+                    server: id.clone(),
+                    rtt_ms: Some(if id == &ss { 500 } else { 10 * (i as u32 + 1) }),
+                    loss_percent: 0,
+                    measured_at_unix_ms: 0,
+                },
+            );
+        }
+
+        sup.settings.preferred_transports = vec![TransportKind::Shadowsocks];
+        assert_eq!(sup.select_server(None).unwrap(), ss);
+    }
+
+    #[tokio::test]
+    async fn a_preference_nothing_matches_is_ignored() {
+        // «Лучше вот так» — не то же самое, что «иначе не подключаться».
+        // Отказ оставил бы пользователя без сети ради настройки, которой в
+        // подписке просто нечем удовлетворить.
+        use sont_core::TransportKind;
+
+        let (mut sup, _dir) = make(true);
+        sup.settings.preferred_transports = vec![TransportKind::WireGuard];
+
+        assert!(
+            sup.servers
+                .iter()
+                .all(|s| s.transport.kind() != TransportKind::WireGuard),
+            "тест опирается на отсутствие WireGuard в демо-наборе"
+        );
+        assert!(sup.select_server(None).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_setting_that_changes_the_core_config_reconnects_by_itself() {
+        // Иначе пользователь переключает режим, видит новое значение в
+        // интерфейсе — и продолжает работать по старой конфигурации, пока не
+        // догадается переподключиться вручную.
+        let (mut sup, _dir) = make(true);
+        let ids: Vec<ProfileId> = sup.servers.iter().map(|s| s.id.clone()).collect();
+        connect_to(&mut sup, &ids[0]);
+
+        sup.handle(Request::PatchSettings {
+            patch: sont_core::SettingsPatch {
+                mode: Some(sont_core::ConnectionMode::Proxy),
+                ..Default::default()
+            },
+        });
+
+        assert_eq!(sup.state.kind(), "reconnecting");
+    }
+
+    #[tokio::test]
+    async fn a_setting_changed_mid_connect_restarts_the_attempt() {
+        // Пользователь переключает режим, не дождавшись подключения, и
+        // возвращает обратно. Прежде попытка, начатая до правки, доигрывала
+        // со старой конфигурацией — соединение поднималось в отменённом
+        // режиме либо не поднималось вовсе.
+        let (mut sup, _dir) = make(true);
+        let ids: Vec<ProfileId> = sup.servers.iter().map(|s| s.id.clone()).collect();
+
+        sup.handle(Request::Connect {
+            server: Some(ids[0].clone()),
+        });
+        let stale = sup.generation;
+        assert_eq!(sup.state.kind(), "connecting");
+
+        sup.handle(Request::PatchSettings {
+            patch: sont_core::SettingsPatch {
+                mode: Some(sont_core::ConnectionMode::Proxy),
+                ..Default::default()
+            },
+        });
+        assert!(sup.generation > stale, "попытка должна начаться заново");
+        assert_eq!(sup.state.kind(), "connecting", "разрыва не было");
+
+        // Результат прежней попытки приходит уже ни к чему.
+        sup.handle_internal(core_started(stale));
+        assert_eq!(sup.state.kind(), "connecting");
+
+        sup.handle_internal(core_started(sup.generation));
+        assert_eq!(sup.state.kind(), "connected");
+        assert_eq!(sup.settings.mode, sont_core::ConnectionMode::Proxy);
+    }
+
+    #[tokio::test]
+    async fn a_cosmetic_setting_leaves_the_connection_alone() {
+        // Смена языка не повод рвать соединение.
+        let (mut sup, _dir) = make(true);
+        let ids: Vec<ProfileId> = sup.servers.iter().map(|s| s.id.clone()).collect();
+        connect_to(&mut sup, &ids[0]);
+
+        sup.handle(Request::PatchSettings {
+            patch: sont_core::SettingsPatch {
+                language: Some("en".into()),
+                ..Default::default()
+            },
+        });
+
+        assert_eq!(sup.state.kind(), "connected");
+    }
+
+    #[tokio::test]
+    async fn a_much_faster_server_is_taken_when_asked() {
+        // Ради этого настройка и заводится: замер показал сервер заметно
+        // быстрее — демон переходит на него сам.
+        let (mut sup, _dir) = make(true);
+        sup.settings.auto_switch = true;
+        sup.settings.switch_threshold_ms = 30;
+
+        let ids: Vec<ProfileId> = sup.servers.iter().map(|s| s.id.clone()).collect();
+        connect_to(&mut sup, &ids[0]);
+
+        report_probes(&mut sup, &[(0, 200), (1, 20)]);
+
+        assert_eq!(sup.state.server(), Some(&ids[1]));
+        assert!(
+            !sup.recently_failed(&ids[0]),
+            "прежний сервер исправен — в штрафной ящик ему не за что"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_marginally_faster_server_is_left_alone() {
+        // Смена сервера рвёт все соединения. Делать это ради нескольких
+        // миллисекунд — вредить, а не улучшать.
+        let (mut sup, _dir) = make(true);
+        sup.settings.auto_switch = true;
+        sup.settings.switch_threshold_ms = 30;
+
+        let ids: Vec<ProfileId> = sup.servers.iter().map(|s| s.id.clone()).collect();
+        connect_to(&mut sup, &ids[0]);
+
+        report_probes(&mut sup, &[(0, 50), (1, 29)]);
+
+        assert_eq!(sup.state.server(), Some(&ids[0]));
+    }
+
+    #[tokio::test]
+    async fn switching_stays_off_unless_asked() {
+        // Значение по умолчанию: демон не рвёт соединения по своей инициативе.
+        let (mut sup, _dir) = make(true);
+        assert!(!sup.settings.auto_switch);
+
+        let ids: Vec<ProfileId> = sup.servers.iter().map(|s| s.id.clone()).collect();
+        connect_to(&mut sup, &ids[0]);
+
+        report_probes(&mut sup, &[(0, 500), (1, 10)]);
+
+        assert_eq!(sup.state.server(), Some(&ids[0]));
+    }
+
+    #[tokio::test]
+    async fn a_pinned_server_is_never_taken_away() {
+        // Пользователь выбрал сервер сам — это его решение, а не подсказка.
+        let (mut sup, _dir) = make(true);
+        sup.settings.auto_switch = true;
+        sup.settings.auto_select_server = false;
+
+        let ids: Vec<ProfileId> = sup.servers.iter().map(|s| s.id.clone()).collect();
+        sup.settings.pinned_server = Some(ids[0].clone());
+        connect_to(&mut sup, &ids[0]);
+
+        report_probes(&mut sup, &[(0, 500), (1, 10)]);
+
+        assert_eq!(sup.state.server(), Some(&ids[0]));
+    }
+
+    #[tokio::test]
+    async fn a_fallen_server_is_replaced_by_the_fastest_one() {
+        // Ради этого замеры и делаются: пользователь остался без сети, и
+        // выбирать наугад, когда известно, кто отвечает быстрее всех, незачем.
+        let (mut sup, _dir) = make(true);
+        assert!(sup.servers.len() >= 3, "нужен выбор из нескольких серверов");
+
+        let ids: Vec<ProfileId> = sup.servers.iter().map(|s| s.id.clone()).collect();
+        // Нулевой — текущий, второй заведомо быстрее первого.
+        set_probes(&mut sup, &[(0, 20), (1, 300), (2, 40)]);
+        connect_to(&mut sup, &ids[0]);
+
+        sup.handle_internal(Internal::CoreStarted {
+            generation: sup.generation,
+            result: Box::new(Err(TunnelError::HandshakeTimeout { seconds: 20 })),
+        });
+
+        assert_eq!(
+            sup.state.server(),
+            Some(&ids[2]),
+            "замену выбирают по замеру, а не по порядку в списке"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_fallen_server_is_announced_with_its_replacement() {
+        // Отдельное событие, потому что из «переподключаюсь» не восстановить,
+        // какой сервер выбыл и почему адрес сменился.
+        let (mut sup, _dir) = make(true);
+        let mut events = sup.events.subscribe();
+
+        let ids: Vec<ProfileId> = sup.servers.iter().map(|s| s.id.clone()).collect();
+        set_probes(&mut sup, &[(0, 20), (1, 300), (2, 40)]);
+        connect_to(&mut sup, &ids[0]);
+
+        sup.handle_internal(Internal::CoreStarted {
+            generation: sup.generation,
+            result: Box::new(Err(TunnelError::HandshakeTimeout { seconds: 20 })),
+        });
+
+        let mut failure = None;
+        while let Ok(event) = events.try_recv() {
+            if let Event::ServerFailed(f) = event {
+                failure = Some(f);
+            }
+        }
+
+        let failure = failure.expect("падение сервера обязано быть объявлено");
+        assert_eq!(failure.server, ids[0]);
+        assert_eq!(failure.switching_to.as_ref(), Some(&ids[2]));
+        assert_eq!(
+            failure.switching_to_rtt_ms,
+            Some(40),
+            "без задержки сообщение о смене сервера ничего не объясняет"
+        );
+        assert!(!failure.name.is_empty(), "по одному id сервер не опознать");
+    }
+
+    #[tokio::test]
+    async fn a_fallen_server_is_not_chosen_again_right_away() {
+        // Замер упавший сервер не отличает: TCP до него доходит, отказывает
+        // туннель поверх. Без памяти о падении «лучший по пингу» вернул бы нас
+        // ровно туда, откуда мы только что ушли.
+        let (mut sup, _dir) = make(true);
+        let ids: Vec<ProfileId> = sup.servers.iter().map(|s| s.id.clone()).collect();
+
+        // Упавший — самый быстрый по замеру.
+        set_probes(&mut sup, &[(0, 10), (1, 100), (2, 50)]);
+        connect_to(&mut sup, &ids[0]);
+        sup.handle_internal(Internal::CoreStarted {
+            generation: sup.generation,
+            result: Box::new(Err(TunnelError::HandshakeTimeout { seconds: 20 })),
+        });
+
+        assert_ne!(sup.state.server(), Some(&ids[0]));
+        assert!(sup.recently_failed(&ids[0]));
+    }
+
+    #[tokio::test]
+    async fn a_lost_network_does_not_move_us_off_the_server() {
+        // Пропавшая сеть повторится один в один на любом сервере. Смена
+        // адреса вместо соединения — это не помощь, а лишняя путаница.
+        let (mut sup, _dir) = make(true);
+        let ids: Vec<ProfileId> = sup.servers.iter().map(|s| s.id.clone()).collect();
+        set_probes(&mut sup, &[(0, 200), (1, 10)]);
+        connect_to(&mut sup, &ids[0]);
+
+        sup.begin_reconnect(ReconnectCause::NetworkChanged);
+
+        assert_eq!(
+            sup.state.server(),
+            Some(&ids[0]),
+            "причина не в сервере — менять его незачем"
+        );
+        assert!(!sup.recently_failed(&ids[0]));
+    }
+
+    #[tokio::test]
+    async fn the_last_server_left_is_retried_rather_than_abandoned() {
+        // Один сервер в подписке — обычное дело. Отказаться от попыток только
+        // потому, что заменить его некем, значит оставить пользователя без
+        // связи там, где помогло бы простое повторение.
+        let (mut sup, _dir) = make(true);
+        sup.servers.truncate(1);
+        let only = sup.servers[0].id.clone();
+        connect_to(&mut sup, &only);
+
+        sup.handle_internal(Internal::CoreStarted {
+            generation: sup.generation,
+            result: Box::new(Err(TunnelError::HandshakeTimeout { seconds: 20 })),
+        });
+
+        assert_eq!(sup.state.server(), Some(&only));
+        assert_eq!(sup.state.kind(), "reconnecting");
+    }
+
+    #[tokio::test]
+    async fn a_server_that_works_again_leaves_the_penalty_box() {
+        // Иначе однажды упавший сервер обходили бы стороной ещё десять минут
+        // после того, как он снова начал работать.
+        let (mut sup, _dir) = make(true);
+        let ids: Vec<ProfileId> = sup.servers.iter().map(|s| s.id.clone()).collect();
+        connect_to(&mut sup, &ids[0]);
+
+        sup.failed_servers.insert(ids[0].clone(), Instant::now());
+        assert!(sup.recently_failed(&ids[0]));
+
+        connect_to(&mut sup, &ids[0]);
+        assert!(!sup.recently_failed(&ids[0]));
+    }
+
     #[tokio::test]
     async fn subscription_url_must_be_http() {
         let (mut sup, _dir) = make(false);
-        let response = sup.handle(Request::SetSubscription {
+        let response = sup.handle(Request::AddSubscription {
             url: Secret::new("vless://not-a-subscription"),
         });
         assert!(matches!(
             response,
             Response::Error(IpcError::InvalidRequest { .. })
         ));
-        assert!(sup.subscription.is_none());
+        assert!(sup.subscriptions.is_empty());
     }
 
     #[tokio::test]
@@ -1867,22 +3456,130 @@ mod tests {
         let (mut sup, _dir) = make(false);
         let url = "https://panel.example/sub/VERY-SECRET-TOKEN";
         assert_eq!(
-            sup.handle(Request::SetSubscription {
+            sup.handle(Request::AddSubscription {
                 url: Secret::new(url)
             }),
             Response::Accepted
         );
 
-        let status = sup.subscription.as_ref().expect("подписка должна сохраниться");
+        let entry = sup.subscriptions.first().expect("подписка должна сохраниться");
         assert!(
-            !status.masked_url.contains("VERY-SECRET-TOKEN"),
+            !entry.masked_url.contains("VERY-SECRET-TOKEN"),
             "маска не должна раскрывать токен: {}",
-            status.masked_url
+            entry.masked_url
         );
 
         // Снимок состояния тоже не должен содержать настоящую ссылку.
         let json = serde_json::to_string(&sup.snapshot()).unwrap();
         assert!(!json.contains("VERY-SECRET-TOKEN"), "утечка через снимок: {json}");
+
+        // И ответ на перечисление подписок тоже: он уходит непривилегированному
+        // клиенту, которому исходная ссылка ни к чему.
+        let json = serde_json::to_string(&sup.handle(Request::ListSubscriptions)).unwrap();
+        assert!(!json.contains("VERY-SECRET-TOKEN"), "утечка через список: {json}");
+    }
+
+    #[tokio::test]
+    async fn the_key_comes_out_only_when_asked_for_it() {
+        // Список подписок отдаёт маску — этого хватает, чтобы показать
+        // подписку. Настоящий ключ выдаётся отдельным запросом и только им:
+        // он нужен ровно для «скопировать» и «показать QR».
+        let (mut sup, _dir) = make(false);
+        let url = "https://panel.example/sub/VERY-SECRET-TOKEN";
+        sup.handle(Request::AddSubscription {
+            url: Secret::new(url),
+        });
+        let id = sup.subscriptions[0].id.clone();
+
+        let Response::SubscriptionSecret(secret) =
+            sup.handle(Request::RevealSubscription { id: id.clone() })
+        else {
+            panic!("ключ должен выдаваться по запросу");
+        };
+        assert_eq!(secret.expose(), url);
+
+        // Но даже в ответе он не раскрывается отладочной печатью.
+        assert!(!format!("{secret:?}").contains("VERY-SECRET-TOKEN"));
+
+        // Несуществующая подписка — ошибка запроса, а не пустой ответ:
+        // молчаливое «ничего» клиент принял бы за отсутствие ключа.
+        assert!(matches!(
+            sup.handle(Request::RevealSubscription {
+                id: SubscriptionId::from_raw("нет такой")
+            }),
+            Response::Error(IpcError::InvalidRequest { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn the_same_url_added_twice_stays_one_subscription() {
+        // Пользователь, вставивший ссылку дважды, ожидает одну подписку.
+        // Две одинаковые дали бы каждый сервер парой — и «избранное» с
+        // закреплением перестали бы означать что-то определённое.
+        let (mut sup, _dir) = make(false);
+        let url = "https://panel.example/sub/TOKEN";
+
+        sup.handle(Request::AddSubscription {
+            url: Secret::new(url),
+        });
+        sup.handle(Request::AddSubscription {
+            url: Secret::new(url),
+        });
+
+        assert_eq!(sup.subscriptions.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn subscriptions_are_independent() {
+        // Смысл нескольких подписок в том, что они не связаны: одна панель
+        // легла — вторая продолжает давать серверы.
+        let (mut sup, _dir) = make(false);
+        sup.handle(Request::AddSubscription {
+            url: Secret::new("https://first.example/sub"),
+        });
+        sup.handle(Request::AddSubscription {
+            url: Secret::new("https://second.example/sub"),
+        });
+        assert_eq!(sup.subscriptions.len(), 2);
+
+        let first = sup.subscriptions[0].id.clone();
+        assert_eq!(
+            sup.handle(Request::RemoveSubscription { id: first.clone() }),
+            Response::Accepted
+        );
+
+        assert_eq!(sup.subscriptions.len(), 1);
+        assert_ne!(sup.subscriptions[0].id, first);
+
+        // Удаление того, чего нет, — ошибка запроса, а не молчаливый успех:
+        // иначе опечатка в идентификаторе выглядит как выполненная команда.
+        assert!(matches!(
+            sup.handle(Request::RemoveSubscription { id: first }),
+            Response::Error(IpcError::InvalidRequest { .. })
+        ));
+    }
+
+    #[test]
+    fn servers_from_several_subscriptions_are_merged_without_duplicates() {
+        // Панели перепродают одни и те же узлы, а id считается от адреса и
+        // учётных данных — совпадения неизбежны. Два профиля с одним id в
+        // списке означали бы, что закреплённый сервер указывает на оба сразу.
+        let shared = demo::servers().into_iter().next().unwrap();
+        let entry = |id: &str, profiles: Vec<ServerProfile>| SubscriptionEntry {
+            id: SubscriptionId::from_raw(id),
+            secret: Secret::new("https://panel.example/sub"),
+            masked_url: "htt…sub".into(),
+            profiles,
+            info: SubscriptionInfo::default(),
+        };
+
+        let merged = merge_servers(&[
+            entry("a", vec![shared.clone()]),
+            entry("b", vec![shared.clone()]),
+        ]);
+
+        assert_eq!(merged.len(), 1, "один и тот же сервер не должен удвоиться");
+        assert_eq!(merged[0].id, shared.id);
     }
 
     #[tokio::test]
@@ -2050,19 +3747,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn repeated_failures_move_to_another_server() {
-        // Держаться за упавший сервер бессмысленно, когда в подписке есть
-        // другие: пользователю нужна сеть, а не конкретный сервер.
+    async fn stubborn_trouble_moves_to_another_server_even_if_the_server_looks_innocent() {
+        // Пропавшая сеть — не повод менять сервер: на другом она пропадёт так
+        // же. Но если не выходит и после нескольких попыток, дело всё-таки
+        // может быть в нём, и держаться за него дальше значит оставлять
+        // пользователя без сети из принципа.
         let (mut sup, _dir) = make(true);
         sup.handle(Request::Connect { server: None });
         let first = sup.state.server().cloned().unwrap();
 
-        for _ in 0..=SWITCH_SERVER_AFTER {
-            sup.begin_reconnect(ReconnectCause::CoreExited { code: None });
+        for _ in 0..sup.settings.reconnect_attempts {
+            sup.begin_reconnect(ReconnectCause::NetworkChanged);
+            assert_eq!(
+                sup.state.server(),
+                Some(&first),
+                "пока попыток немного, сервер менять незачем"
+            );
         }
 
-        let now = sup.state.server().cloned().unwrap();
-        assert_ne!(now, first, "после серии неудач сервер должен смениться");
+        sup.begin_reconnect(ReconnectCause::NetworkChanged);
+        assert_ne!(
+            sup.state.server(),
+            Some(&first),
+            "после серии неудач стоит попробовать другой сервер"
+        );
     }
 
     #[tokio::test]
@@ -2141,7 +3849,7 @@ mod tests {
         sup.desired = Desired::Connected { server: None };
         sup.handle_internal(Internal::CoreStarted {
             generation: sup.generation,
-            result: Err(TunnelError::NoSubscription),
+            result: Box::new(Err(TunnelError::NoSubscription)),
         });
 
         assert_eq!(sup.state.kind(), "failed");
@@ -2156,7 +3864,7 @@ mod tests {
 
         sup.handle_internal(Internal::CoreStarted {
             generation: g,
-            result: Err(TunnelError::HandshakeTimeout { seconds: 20 }),
+            result: Box::new(Err(TunnelError::HandshakeTimeout { seconds: 20 })),
         });
 
         assert_eq!(
@@ -2167,15 +3875,43 @@ mod tests {
     }
 
     #[test]
-    fn service_ports_differ_between_launches() {
-        // Иначе быстрое переподключение упрётся в сокет, ещё занятый
-        // прежним экземпляром ядра.
-        let settings = Settings::default();
-        let first = runtime_info(&settings);
-        let second = runtime_info(&settings);
+    fn both_proxy_inbounds_ask_for_their_stable_numbers() {
+        // Адреса прокси видит пользователь: они лежат в настройках системы и
+        // могут быть прописаны в отдельном приложении вручную. Меняться от
+        // подключения к подключению им нельзя, поэтому оба входа просят
+        // конкретный номер, а не любой свободный порт.
+        //
+        // Свободен ли этот номер на машине, где идут тесты, к делу отношения
+        // не имеет: занят — отход на свободный порт правильное поведение.
+        // Поэтому в каждой ветке проверяется своё утверждение.
+        fn free(port: u16) -> bool {
+            std::net::TcpListener::bind(("127.0.0.1", port)).is_ok()
+        }
 
-        assert_ne!(first.probe_listen, second.probe_listen);
-        assert_ne!(first.metrics_listen, second.metrics_listen);
+        let settings = Settings::default();
+        let (http_free, socks_free) = (free(PREFERRED_HTTP_PORT), free(PREFERRED_SOCKS_PORT));
+        let runtime = runtime_info(&settings);
+
+        if http_free {
+            assert_eq!(runtime.http_listen, format!("127.0.0.1:{PREFERRED_HTTP_PORT}"));
+        } else {
+            assert_ne!(runtime.http_listen, format!("127.0.0.1:{PREFERRED_HTTP_PORT}"));
+        }
+        if socks_free {
+            assert_eq!(
+                runtime.probe_listen,
+                format!("127.0.0.1:{PREFERRED_SOCKS_PORT}")
+            );
+        } else {
+            assert_ne!(
+                runtime.probe_listen,
+                format!("127.0.0.1:{PREFERRED_SOCKS_PORT}")
+            );
+        }
+
+        // А служебному порту статистики постоянство ни к чему: наружу он не
+        // объявляется, и фиксированный номер только создавал бы конфликты.
+        assert_ne!(runtime.metrics_listen, runtime_info(&settings).metrics_listen);
     }
 
     #[test]

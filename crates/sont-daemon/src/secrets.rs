@@ -19,24 +19,13 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use sont_core::Secret;
 
-/// Сохраняет ключ в защищённом виде.
-pub fn store(path: &Path, secret: &Secret) -> Result<()> {
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir)?;
-    }
-
-    let protected = platform::protect(secret.expose().as_bytes())
-        .context("не удалось зашифровать ключ подписки")?;
-
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, &protected)?;
-    restrict_permissions(&tmp)?;
-    std::fs::rename(&tmp, path)?;
-
-    Ok(())
-}
-
-/// Читает ключ. `Ok(None)` — ключ не задан.
+/// Читает ключ, сохранённый в раскладке до появления списка подписок.
+///
+/// Писать в этом формате больше нечему: подписки хранятся списком через
+/// [`store_json`]. Чтение осталось ради переноса — ключ пользователя не должен
+/// пропасть из-за того, что у нас поменялась структура файлов.
+///
+/// `Ok(None)` — файла нет.
 pub fn load(path: &Path) -> Result<Option<Secret>> {
     let raw = match std::fs::read(path) {
         Ok(raw) => raw,
@@ -240,31 +229,39 @@ mod platform {
 mod tests {
     use super::*;
 
+    /// Список подписок в том виде, в каком его пишет демон.
+    fn subscriptions(url: &str) -> Vec<Secret> {
+        vec![Secret::new(url)]
+    }
+
     #[test]
     fn store_then_load_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("subscription.bin");
-        let secret = Secret::new("https://panel.example/sub/VERY-SECRET-TOKEN");
+        let path = dir.path().join("subscriptions.bin");
+        let stored = subscriptions("https://panel.example/sub/VERY-SECRET-TOKEN");
 
-        store(&path, &secret).unwrap();
-        let loaded = load(&path).unwrap().expect("ключ должен прочитаться");
-        assert_eq!(loaded.expose(), secret.expose());
+        store_json(&path, &stored).unwrap();
+        let loaded: Vec<Secret> = load_json(&path).expect("подписки должны прочитаться");
+        assert_eq!(loaded[0].expose(), stored[0].expose());
     }
 
     #[test]
     fn missing_file_yields_none() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(load(&dir.path().join("absent.bin")).unwrap().is_none());
+        let absent = dir.path().join("absent.bin");
+        assert!(load_json::<Vec<Secret>>(&absent).is_none());
+        // Прежняя, одноподписочная раскладка читается тем же способом.
+        assert!(load(&absent).unwrap().is_none());
     }
 
     #[test]
-    fn clear_removes_the_key_and_is_idempotent() {
+    fn clear_removes_the_file_and_is_idempotent() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("subscription.bin");
+        let path = dir.path().join("subscriptions.bin");
 
-        store(&path, &Secret::new("https://example/sub")).unwrap();
+        store_json(&path, &subscriptions("https://example/sub")).unwrap();
         clear(&path).unwrap();
-        assert!(load(&path).unwrap().is_none());
+        assert!(load_json::<Vec<Secret>>(&path).is_none());
         // Повторное удаление не должно быть ошибкой.
         clear(&path).unwrap();
     }
@@ -275,10 +272,14 @@ mod tests {
         // Главное свойство: содержимое файла не выдаёт ключ тому, кто просто
         // откроет его текстовым редактором.
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("subscription.bin");
+        let path = dir.path().join("subscriptions.bin");
         let token = "VERY-SECRET-TOKEN-12345";
 
-        store(&path, &Secret::new(format!("https://panel.example/sub/{token}"))).unwrap();
+        store_json(
+            &path,
+            &subscriptions(&format!("https://panel.example/sub/{token}")),
+        )
+        .unwrap();
 
         let raw = std::fs::read(&path).unwrap();
         let as_text = String::from_utf8_lossy(&raw);
@@ -288,24 +289,27 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn tampered_file_fails_to_decrypt() {
+    fn tampered_file_is_rejected() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("subscription.bin");
-        store(&path, &Secret::new("https://example/sub")).unwrap();
+        let path = dir.path().join("subscriptions.bin");
+        store_json(&path, &subscriptions("https://example/sub")).unwrap();
 
         let mut raw = std::fs::read(&path).unwrap();
         let last = raw.len() - 1;
         raw[last] ^= 0xff;
         std::fs::write(&path, &raw).unwrap();
 
-        assert!(load(&path).is_err(), "испорченный шифротекст должен отвергаться");
+        assert!(
+            load_json::<Vec<Secret>>(&path).is_none(),
+            "испорченный шифротекст должен отвергаться"
+        );
     }
 
     #[test]
     fn no_temp_file_is_left_behind() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("subscription.bin");
-        store(&path, &Secret::new("https://example/sub")).unwrap();
+        let path = dir.path().join("subscriptions.bin");
+        store_json(&path, &subscriptions("https://example/sub")).unwrap();
         assert!(!path.with_extension("tmp").exists());
     }
 }

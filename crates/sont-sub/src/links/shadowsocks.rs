@@ -24,8 +24,13 @@ pub fn parse(line: &str, source: &SubscriptionId) -> Result<ServerProfile, LinkE
         None => (rest, None),
     };
 
-    // Параметры запроса (plugin и прочее) нам не нужны, но мешают разбору.
-    let body = body.split('?').next().unwrap_or(body);
+    // Параметры отделяем от тела, но не выбрасываем: в них лежит `plugin`, от
+    // которого зависит, сможем ли мы вообще подключиться к этому серверу.
+    let (body, query) = match body.split_once('?') {
+        Some((b, q)) => (b, Some(q)),
+        None => (body, None),
+    };
+    let plugin = query.and_then(plugin_name);
 
     let (method, password, endpoint) = if let Some((userinfo, hostpart)) = body.rsplit_once('@') {
         // SIP002: userinfo отдельно, адрес в открытом виде.
@@ -54,9 +59,30 @@ pub fn parse(line: &str, source: &SubscriptionId) -> Result<ServerProfile, LinkE
     let transport = Transport::Shadowsocks(Shadowsocks {
         method,
         password: Secret::new(password),
+        plugin,
     });
 
     Ok(ServerProfile::new(name, endpoint, transport, source.clone()))
+}
+
+/// Имя плагина SIP003 из строки запроса.
+///
+/// Значение выглядит как `obfs-local;obfs=http;obfs-host=example.com` — до
+/// первой точки с запятой имя, дальше аргументы. Аргументы не разбираем: для
+/// решения «сможем ли мы подключиться» достаточно самого факта плагина, а имя
+/// нужно, чтобы отказ был не «этот сервер не поддерживается», а с названием.
+fn plugin_name(query: &str) -> Option<String> {
+    let raw = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(key, _)| *key == "plugin")
+        .map(|(_, value)| value)?;
+
+    let decoded = percent_decode_str(raw).decode_utf8_lossy().into_owned();
+    let name = decoded.split(';').next().unwrap_or(&decoded).trim();
+
+    // `plugin=` без значения встречается и означает «плагина нет».
+    (!name.is_empty()).then(|| name.to_owned())
 }
 
 /// Userinfo в SIP002 — base64url от `method:password`, но часть панелей
@@ -202,12 +228,50 @@ mod tests {
         assert_eq!(p.endpoint, Endpoint::new("2001:db8::1", 8388));
     }
 
+    fn plugin_of(p: &ServerProfile) -> Option<&str> {
+        let Transport::Shadowsocks(ss) = &p.transport else {
+            panic!("ожидался Shadowsocks");
+        };
+        ss.plugin.as_deref()
+    }
+
     #[test]
-    fn plugin_query_is_ignored_without_breaking_parsing() {
+    fn plugin_is_remembered_not_discarded() {
+        // Выбросив плагин, мы получили бы профиль, который выглядит рабочим и
+        // принимается ядром, — и молча не соединяется, потому что сервер ждёт
+        // обфускации, которой нет. Запоминаем, чтобы отказать понятно.
         let userinfo = STANDARD.encode("aes-256-gcm:pw");
         let line = format!("ss://{userinfo}@example.com:443?plugin=obfs-local%3Bobfs%3Dhttp#Plugin");
         let p = parse(&line, &source()).unwrap();
+
         assert_eq!(p.endpoint.port, 443);
+        assert_eq!(plugin_of(&p), Some("obfs-local"));
+    }
+
+    #[test]
+    fn plugin_arguments_do_not_leak_into_the_name() {
+        let userinfo = STANDARD.encode("aes-256-gcm:pw");
+        let line = format!(
+            "ss://{userinfo}@example.com:443?plugin=v2ray-plugin%3Bmode%3Dwebsocket%3Btls#WS"
+        );
+        assert_eq!(plugin_of(&parse(&line, &source()).unwrap()), Some("v2ray-plugin"));
+    }
+
+    #[test]
+    fn no_plugin_means_none() {
+        let userinfo = STANDARD.encode("aes-256-gcm:pw");
+
+        // Совсем без параметров.
+        let line = format!("ss://{userinfo}@example.com:443#Plain");
+        assert_eq!(plugin_of(&parse(&line, &source()).unwrap()), None);
+
+        // Параметры есть, плагина среди них нет.
+        let line = format!("ss://{userinfo}@example.com:443?group=ru#Plain");
+        assert_eq!(plugin_of(&parse(&line, &source()).unwrap()), None);
+
+        // Пустое значение — то же самое, что его отсутствие.
+        let line = format!("ss://{userinfo}@example.com:443?plugin=#Plain");
+        assert_eq!(plugin_of(&parse(&line, &source()).unwrap()), None);
     }
 
     #[test]

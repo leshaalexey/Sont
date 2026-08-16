@@ -14,7 +14,7 @@ use crate::support;
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
 pub enum BuildError {
     #[error("сервер не поддерживается: {0}")]
-    Unsupported(&'static str),
+    Unsupported(String),
 }
 
 /// Параметры окружения, которые знает демон, а не профиль сервера.
@@ -737,6 +737,7 @@ mod tests {
             Transport::Shadowsocks(Shadowsocks {
                 method: "2022-blake3-aes-128-gcm".into(),
                 password: Secret::new("pw"),
+                plugin: None,
             }),
             source(),
         );
@@ -749,6 +750,27 @@ mod tests {
             out.get("streamSettings").is_none(),
             "у Shadowsocks собственный транспорт"
         );
+    }
+
+    #[test]
+    fn shadowsocks_with_a_plugin_does_not_reach_the_core() {
+        // Конфиг для такого сервера ядро приняло бы — и молча не соединилось,
+        // потому что сервер ждёт обфускации, которую запускать нечем.
+        // Отказать надо до запуска, назвав причину.
+        let server = ServerProfile::new(
+            "SS+obfs",
+            Endpoint::new("fi.example.com", 8388),
+            Transport::Shadowsocks(Shadowsocks {
+                method: "aes-256-gcm".into(),
+                password: Secret::new("pw"),
+                plugin: Some("obfs-local".into()),
+            }),
+            source(),
+        );
+
+        let err = build(&server, &Settings::default(), &RuntimeInfo::default()).unwrap_err();
+        let BuildError::Unsupported(reason) = err;
+        assert!(reason.contains("obfs-local"), "в отказе нет плагина: {reason}");
     }
 
     #[test]

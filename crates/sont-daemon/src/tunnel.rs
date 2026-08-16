@@ -51,6 +51,20 @@ pub struct Tunnel {
     task: tokio::task::JoinHandle<std::io::Result<usize>>,
 }
 
+/// Второй уровень защиты, а не основной: обычный путь остановки — `stop()`,
+/// который ждёт, пока задача снимет маршруты и адаптер. Но если `Tunnel` всё
+/// же будет отброшен без вызова (забытая передача предыдущей сессии, паника
+/// по пути), сама задача не должна остаться работать бесконтрольно: без
+/// отмены `general_run_async` продолжает крутиться в рантайме демона,
+/// удерживая TUN-адаптер и маршруты, о которых больше некому напомнить.
+/// `JoinHandle` при дропе не абортит задачу — отменять её обязана именно
+/// отмена токена.
+impl Drop for Tunnel {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
 impl Tunnel {
     /// Поднимает адаптер и настраивает маршруты.
     pub fn start(config: TunnelConfig) -> Result<Self, TunnelError> {
@@ -115,13 +129,16 @@ impl Tunnel {
     }
 
     /// Останавливает слой и возвращает системные маршруты на место.
-    pub async fn stop(self) {
+    pub async fn stop(mut self) {
         self.shutdown.cancel();
 
         // Ждём именно завершения задачи: она снимает маршруты и удаляет
         // адаптер. Если бросить её и сразу погасить ядро, у пользователя
         // останется таблица маршрутов, указывающая в несуществующий туннель.
-        match tokio::time::timeout(std::time::Duration::from_secs(10), self.task).await {
+        //
+        // Берём задачу по `&mut`, а не забираем её из `self`: `Tunnel`
+        // реализует `Drop`, а из типа с `Drop` нельзя частично вынести поле.
+        match tokio::time::timeout(std::time::Duration::from_secs(10), &mut self.task).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => tracing::warn!(error = %e, "задача сетевого слоя завершилась аварийно"),
             Err(_) => tracing::error!(
