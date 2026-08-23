@@ -189,6 +189,26 @@ cargo test --workspace
 `C:\ProgramData\Sont\core\`. Если рядом с бинарём положить файл
 `xray.exe.sha256`, контрольная сумма будет проверяться перед каждым запуском.
 
+### На Linux
+
+Демону системных библиотек не нужно вовсе — он на чистом Rust с rustls. Окну
+нужен WebKitGTK со свитой, и на NixOS всё это описано в [shell.nix](shell.nix):
+
+```
+nix-shell
+cargo build --release -p sont-daemon
+```
+
+На прочих дистрибутивах те же зависимости ставятся пакетным менеджером:
+`build-essential`, `pkg-config`, `nodejs`, а для окна ещё
+`libwebkit2gtk-4.1-dev`, `libgtk-3-dev`, `libayatana-appindicator3-dev`,
+`librsvg2-dev`.
+
+Ядро кладётся в `/var/lib/sont/core/xray`, файлы `geoip.dat` и `geosite.dat`
+рядом; `wintun.dll` не нужен — TUN на Linux создаёт ядро системы. Запуск —
+`sudo sontd run --foreground`: создание адаптера и правка маршрутов требуют
+`CAP_NET_ADMIN`.
+
 ## Использование
 
 Установка службы и агента, один раз:
