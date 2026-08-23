@@ -89,9 +89,10 @@
     border-radius: 2px;
     background: var(--accent);
     color: var(--on-accent);
+    /* Светлое на тёмном кажется жирнее — ступень вниз выравнивает. */
+    font-weight: calc(500 + var(--on-accent-weight));
     font-family: inherit;
     font-size: 8px;
-    font-weight: 500;
     line-height: 100%;
     display: flex;
     align-items: center;

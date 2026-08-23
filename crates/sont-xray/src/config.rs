@@ -36,6 +36,16 @@ pub struct RuntimeInfo {
     pub log_level: String,
 }
 
+/// Адрес, по которому демон проверяет, работает ли туннель.
+///
+/// Живёт здесь, рядом с правилом маршрутизации, которое загоняет его в
+/// туннель: разъедься эти два места — и проверка пойдёт мимо туннеля,
+/// подтверждая работу того, чего нет.
+pub const HEALTH_CHECK_IP: &str = "1.1.1.1";
+
+/// Полный адрес проверки. Отдаёт заодно видимый снаружи IP-адрес.
+pub const HEALTH_CHECK_URL: &str = "https://1.1.1.1/cdn-cgi/trace";
+
 /// Тег входящего соединения для проверки связности и туннелирования.
 pub const PROBE_INBOUND: &str = "probe-in";
 /// Тег входящего HTTP-соединения.
@@ -458,42 +468,74 @@ fn routing(settings: &Settings) -> Value {
         "outboundTag": BLOCK,
     }));
 
-    // 2. Проверочный вход всегда идёт в туннель.
+    // 2. Проверка связности всегда идёт в туннель.
     //
-    //    Явное правило нужно, чтобы проверка не зависела от остальных: при
-    //    раздельном туннелировании в режиме Include весь неперечисленный
-    //    трафик уходит напрямую, и проверка подтверждала бы работу туннеля,
-    //    не проходя через него.
+    //    Иначе она ничего не проверяет: при раздельном туннелировании в
+    //    режиме Include весь неперечисленный трафик уходит напрямую, и
+    //    проверка подтверждала бы работу туннеля, не проходя через него.
+    //
+    //    Правило по адресу назначения, а не по входу.
+    //
+    //    Раньше здесь стояло `inboundTag: [PROBE_INBOUND, HTTP_INBOUND]` — и
+    //    это отменяло раздельное туннелирование целиком. Через эти два входа
+    //    приходит **весь** трафик: SOCKS принимает то, что подал слой TUN,
+    //    HTTP — то, что система отдала прокси. Правило совпадало с каждым
+    //    соединением, а Xray берёт первое подошедшее — до правил ниже дело
+    //    не доходило никогда. Ни программы, ни сайты из списка исключений
+    //    мимо туннеля не уходили, и понять это по интерфейсу было нельзя:
+    //    он показывал настроенное правило, которого не существовало.
     rules.push(json!({
         "type": "field",
-        "inboundTag": [PROBE_INBOUND, HTTP_INBOUND],
+        "ip": [format!("{HEALTH_CHECK_IP}/32")],
         "outboundTag": PROXY,
     }));
 
     // 3. Раздельное туннелирование. Самое частное из оставшихся правил,
     //    поэтому идёт раньше общих.
     let split = &settings.split_tunnel;
-    if split.is_active() && support::process_routing_available() {
-        match split.mode {
-            SplitTunnelMode::Exclude => rules.push(json!({
-                "type": "field",
-                "process": split.apps,
-                "outboundTag": DIRECT,
-            })),
-            SplitTunnelMode::Include => {
-                // Перечисленные — в туннель, всё прочее напрямую.
+    if split.is_active() {
+        // Программы различает не всякое ядро и не на всякой системе; сайты —
+        // всегда. Поэтому списки проверяются по отдельности: невозможность
+        // одного не должна отменять другое.
+        let apps = (!split.apps.is_empty() && support::process_routing_available())
+            .then_some(&split.apps);
+
+        // `domain:` вместо голой строки: у Xray голая строка — это поиск
+        // подстроки, и «vk.com» поймал бы «notvk.com.evil.net». Префикс даёт
+        // домен и его поддомены, то есть ровно то, что человек имеет в виду,
+        // называя сайт.
+        let sites: Vec<String> = split.sites.iter().map(|d| format!("domain:{d}")).collect();
+        let sites = (!sites.is_empty()).then_some(sites);
+
+        let target = match split.mode {
+            SplitTunnelMode::Exclude => DIRECT,
+            SplitTunnelMode::Include => PROXY,
+            SplitTunnelMode::Off => DIRECT,
+        };
+
+        if !matches!(split.mode, SplitTunnelMode::Off) {
+            if let Some(apps) = apps {
                 rules.push(json!({
                     "type": "field",
-                    "process": split.apps,
-                    "outboundTag": PROXY,
+                    "process": apps,
+                    "outboundTag": target,
                 }));
+            }
+            if let Some(sites) = sites {
+                rules.push(json!({
+                    "type": "field",
+                    "domain": sites,
+                    "outboundTag": target,
+                }));
+            }
+            if matches!(split.mode, SplitTunnelMode::Include) {
+                // Перечисленные ушли в туннель выше, всё прочее — напрямую.
                 rules.push(json!({
                     "type": "field",
                     "network": "tcp,udp",
                     "outboundTag": DIRECT,
                 }));
             }
-            SplitTunnelMode::Off => {}
         }
     }
 
@@ -615,24 +657,23 @@ mod tests {
     }
 
     #[test]
-    fn both_local_inbounds_reach_the_proxy() {
+    fn no_rule_matches_by_inbound() {
+        // Оба входа несут пользовательский трафик: в SOCKS его подаёт слой
+        // TUN, в HTTP — системная настройка прокси. Любое правило по входному
+        // тегу поэтому совпадает со всем подряд и отменяет всё, что ниже.
+        //
+        // Обычное соединение не должно совпасть ни с одним правилом и уйти в
+        // первый outbound — туннель.
         let cfg = build_ok(&xhttp_reality(), &Settings::default());
         let rules = cfg["routing"]["rules"].as_array().unwrap();
 
-        let rule = rules
-            .iter()
-            .find(|r| r["inboundTag"].is_array())
-            .expect("правило для локальных входов должно быть");
-        let tags: Vec<&str> = rule["inboundTag"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
-
-        assert!(tags.contains(&PROBE_INBOUND));
-        assert!(tags.contains(&HTTP_INBOUND));
-        assert_eq!(rule["outboundTag"], PROXY);
+        for rule in rules {
+            assert!(
+                rule.get("inboundTag").is_none(),
+                "правило по входу перехватывает весь трафик: {rule}"
+            );
+        }
+        assert_eq!(cfg["outbounds"][0]["tag"], PROXY);
     }
 
     #[test]
@@ -796,6 +837,7 @@ mod tests {
             split_tunnel: SplitTunnelRules {
                 mode: SplitTunnelMode::Include,
                 apps: vec!["browser.exe".into()],
+                sites: Vec::new()
             },
             ..Default::default()
         };
@@ -804,8 +846,8 @@ mod tests {
 
         let probe = rules
             .iter()
-            .position(|r| r["inboundTag"][0] == PROBE_INBOUND)
-            .expect("правило для проверочного входа должно быть");
+            .position(|r| r["ip"][0] == json!(format!("{HEALTH_CHECK_IP}/32")))
+            .expect("правило для адреса проверки должно быть");
         let catch_all = rules
             .iter()
             .position(|r| r["network"] == "tcp,udp")
@@ -868,6 +910,7 @@ mod tests {
             split_tunnel: SplitTunnelRules {
                 mode: SplitTunnelMode::Exclude,
                 apps: vec!["app.exe".into()],
+                sites: Vec::new()
             },
             ..Default::default()
         };
@@ -942,6 +985,7 @@ mod tests {
             split_tunnel: SplitTunnelRules {
                 mode: SplitTunnelMode::Exclude,
                 apps: vec![r"C:\Program Files\App\app.exe".into()],
+                sites: Vec::new()
             },
             ..Default::default()
         };
@@ -957,6 +1001,110 @@ mod tests {
         assert_eq!(rule["process"][0], r"C:\Program Files\App\app.exe");
     }
 
+    #[test]
+    fn nothing_swallows_the_traffic_before_split_tunnelling() {
+        // Здесь ловится ошибка, из-за которой раздельное туннелирование не
+        // работало вообще: правило `inboundTag: [probe-in, http-in]` стояло
+        // выше и совпадало с каждым соединением — через эти два входа
+        // приходит весь трафик. Xray берёт первое подошедшее правило, и до
+        // списка исключений дело не доходило никогда.
+        let settings = Settings {
+            split_tunnel: SplitTunnelRules {
+                mode: SplitTunnelMode::Exclude,
+                apps: Vec::new(),
+                sites: vec!["kinopoisk.ru".into()],
+            },
+            ..Default::default()
+        };
+
+        let cfg = build_ok(&xhttp_reality(), &settings);
+        let rules = cfg["routing"]["rules"].as_array().unwrap();
+        let split_at = rules
+            .iter()
+            .position(|r| r.get("domain").is_some())
+            .expect("правило раздельного туннелирования должно быть");
+
+        for rule in &rules[..split_at] {
+            assert!(
+                rule.get("inboundTag").is_none(),
+                "правило по входному тегу перехватывает весь трафик: {rule}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_health_check_stays_in_the_tunnel() {
+        // Проверка связности обязана идти через туннель, иначе она
+        // подтверждает работу того, чего нет. Но выделять её надо адресом, а
+        // не входом: вход у неё общий с пользовательским трафиком.
+        let cfg = build_ok(&xhttp_reality(), &Settings::default());
+        let rules = cfg["routing"]["rules"].as_array().unwrap();
+
+        let rule = rules
+            .iter()
+            .find(|r| {
+                r.get("ip")
+                    .and_then(|ip| ip.as_array())
+                    .is_some_and(|ips| ips.iter().any(|v| v == &json!(format!("{HEALTH_CHECK_IP}/32"))))
+            })
+            .expect("адрес проверки должен быть в правилах");
+        assert_eq!(rule["outboundTag"], PROXY);
+    }
+
+    #[test]
+    fn split_tunnel_sends_a_site_direct_with_its_subdomains() {
+        // Банк не пускает с иностранного адреса не браузер, а свой сайт, —
+        // и мимо туннеля надо вывести именно его.
+        let settings = Settings {
+            split_tunnel: SplitTunnelRules {
+                mode: SplitTunnelMode::Exclude,
+                apps: Vec::new(),
+                sites: vec!["bank.example".into()],
+            },
+            ..Default::default()
+        };
+
+        let cfg = build_ok(&xhttp_reality(), &settings);
+        let rules = cfg["routing"]["rules"].as_array().unwrap();
+
+        let rule = rules
+            .iter()
+            .find(|r| r.get("domain").is_some())
+            .expect("правило по домену должно быть");
+        assert_eq!(rule["outboundTag"], DIRECT);
+        assert_eq!(
+            rule["domain"][0], "domain:bank.example",
+            "префикс `domain:` ловит и поддомены, а голая строка — любую \
+             подстроку, включая bank.example.evil.net"
+        );
+    }
+
+    #[test]
+    fn a_site_rule_works_without_process_routing() {
+        // Программы различает не всякая система, сайты — всякая. Список
+        // сайтов не должен пропадать из-за пустого списка программ.
+        let settings = Settings {
+            split_tunnel: SplitTunnelRules {
+                mode: SplitTunnelMode::Include,
+                apps: Vec::new(),
+                sites: vec!["work.example".into()],
+            },
+            ..Default::default()
+        };
+
+        let cfg = build_ok(&xhttp_reality(), &settings);
+        let rules = cfg["routing"]["rules"].as_array().unwrap();
+
+        let rule = rules.iter().find(|r| r.get("domain").is_some()).unwrap();
+        assert_eq!(rule["outboundTag"], PROXY, "в режиме include — в туннель");
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.get("network").is_some() && r["outboundTag"] == DIRECT),
+            "всё прочее должно уходить напрямую"
+        );
+    }
+
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     #[test]
     fn split_tunnel_include_sends_everything_else_direct() {
@@ -964,6 +1112,7 @@ mod tests {
             split_tunnel: SplitTunnelRules {
                 mode: SplitTunnelMode::Include,
                 apps: vec!["browser.exe".into()],
+                sites: Vec::new()
             },
             ..Default::default()
         };

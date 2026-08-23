@@ -65,7 +65,7 @@ const PREVIEW = {
     language: "ru",
     system_accent: false,
     dns: { mode: "tunnel", block_plain_dns: true, fake_ip: false },
-    split_tunnel: { mode: "off", apps: [] },
+    split_tunnel: { mode: "off", apps: [], sites: [] },
   },
   info: { daemon_version: "0.1.0", protocol_version: 4, core_version: "Xray 26.3.27" },
 };
@@ -86,13 +86,16 @@ export const language = derived(settings, ($s) => $s?.language ?? "ru");
  * взят по относительной яркости из WCAG: выше — кладём тёмный текст, ниже —
  * светлый.
  */
+const DARK_TEXT = "rgb(33, 33, 33)";
+const LIGHT_TEXT = "rgb(244, 237, 229)";
+
 function readableOn(hex) {
   const channel = (i) => {
     const v = parseInt(hex.slice(1 + i * 2, 3 + i * 2), 16) / 255;
     return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
   };
   const luminance = 0.2126 * channel(0) + 0.7152 * channel(1) + 0.0722 * channel(2);
-  return luminance > 0.4 ? "rgb(33, 33, 33)" : "rgb(244, 237, 229)";
+  return luminance > 0.4 ? DARK_TEXT : LIGHT_TEXT;
 }
 
 /**
@@ -112,13 +115,26 @@ export async function applyAccent(enabled) {
   if (!hex) {
     root.style.removeProperty("--accent");
     root.style.removeProperty("--on-accent");
+    root.style.removeProperty("--on-accent-weight");
     return;
   }
 
+  const on = readableOn(hex);
   root.style.setProperty("--accent", hex);
-  root.style.setProperty("--on-accent", readableOn(hex));
+  root.style.setProperty("--on-accent", on);
+
+  /*
+   * Светлая надпись на тёмной заливке кажется жирнее тёмной на светлой при
+   * одном и том же начертании: светлое пятно на тёмном фоне «растекается» —
+   * иррадиация. Компенсируем ступенью начертания вниз, чтобы обе выглядели
+   * одинаково плотными. Величина не выведена формулой, а подобрана: пятьдесят
+   * — одна ступень переменной оси Segoe UI Variable.
+   */
+  const light = on !== DARK_TEXT;
+  root.style.setProperty("--on-accent-weight", light ? "-50" : "0");
 }
 
+let previewPick = false;
 let noticeTimer;
 
 /** Показывает короткое сообщение внизу окна. */
@@ -143,6 +159,17 @@ async function call(command, args) {
     // В браузере системного цвета нет — берём узнаваемый синий Windows,
     // чтобы настройку было на чём проверить.
     if (command === "system_accent") return "#0078D4";
+    // В предпросмотре чередуем: первый выбор — сайт, второй — программа.
+    if (command === "pick_app_by_click") {
+      previewPick = !previewPick;
+      return previewPick
+        ? { kind: "site", host: "bank.example", url: "https://bank.example/login" }
+        : {
+            kind: "app",
+            path: "C:\\Program Files\\Mozilla Firefox\\firefox.exe",
+            name: "firefox.exe",
+          };
+    }
     return null;
   }
   return invoke(command, args);

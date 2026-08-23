@@ -74,8 +74,18 @@
       </div>
 
       <span class="actions">
+        <!--
+          Обе подписи лежат друг на друге, и кнопка всегда шириной с более
+          длинную. Иначе при нажатии «Копировать» превращается в
+          «Скопировано», кнопка раздаётся вширь и толкает соседнюю — вместо
+          подтверждения выходит скачок раскладки. Ширина считается сама, так
+          что перевод на любой язык её не сломает.
+        -->
         <button class="act" class:done={copied === sub.id} onclick={() => copy(sub)}>
-          {copied === sub.id ? $t("btn.copied") : $t("btn.copy")}
+          <span class="swap">
+            <span class:muted={copied === sub.id}>{$t("btn.copy")}</span>
+            <span class:muted={copied !== sub.id}>{$t("btn.copied")}</span>
+          </span>
         </button>
         <button class="act" onclick={() => act("remove_subscription", { id: sub.id })}>
           {$t("btn.remove")}
@@ -178,5 +188,18 @@
     background: var(--accent);
     box-shadow: inset 0 0 0 0.5px var(--accent);
     color: var(--on-accent);
+    /* Светлое на тёмном кажется жирнее — ступень вниз выравнивает. */
+    font-weight: calc(500 + var(--on-accent-weight));
+  }
+
+  /* Обе подписи в одной ячейке сетки: место занимают обе, видна одна. */
+  .swap {
+    display: grid;
+  }
+  .swap > span {
+    grid-area: 1 / 1;
+  }
+  .muted {
+    visibility: hidden;
   }
 </style>

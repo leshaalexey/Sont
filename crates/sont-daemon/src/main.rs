@@ -764,7 +764,8 @@ async fn agent_cmd(action: AgentAction) -> Result<()> {
 }
 
 /// Адрес проверки: IP-литерал, чтобы не зависеть от DNS.
-const CHECK_URL: &str = "https://1.1.1.1/cdn-cgi/trace";
+/// Тот же адрес, что загоняется в туннель правилом маршрутизации ядра.
+const CHECK_URL: &str = sont_xray::config::HEALTH_CHECK_URL;
 
 /// Внешний адрес по указанному пути.
 async fn external_ip(client: reqwest::Client) -> Option<String> {
@@ -773,6 +774,34 @@ async fn external_ip(client: reqwest::Client) -> Option<String> {
         .find_map(|l| l.strip_prefix("ip="))
         .map(|ip| ip.trim().to_owned())
         .filter(|ip| !ip.is_empty())
+}
+
+/// Один и тот же ли это выход в интернет.
+///
+/// # Почему не побайтовое равенство
+///
+/// Провайдер сервера выпускает трафик с нескольких адресов одной подсети и
+/// раздаёт их между соединениями как придётся. Проверка, требовавшая точного
+/// совпадения, объявляла исправный туннель дырявым: два ответа вида
+/// `152.233.35.212` и `152.233.35.206` — это один выход, а не утечка мимо
+/// сервера. Диагностика, которая пугает на ровном месте, хуже отсутствующей:
+/// после первого ложного тревожного вывода ей перестают верить и в настоящем
+/// случае.
+///
+/// Сравнение по сети, конечно, огрубление: два разных выхода могут оказаться
+/// в одной подсети. Но чтобы это дало ложное «всё в порядке», надо чтобы и
+/// провайдер VPN, и домашний провайдер стояли в одной /24 — а это уже не
+/// утечка, а совпадение из другого мира.
+fn same_exit(a: &str, b: &str) -> bool {
+    use std::net::IpAddr;
+
+    match (a.parse::<IpAddr>(), b.parse::<IpAddr>()) {
+        (Ok(IpAddr::V4(a)), Ok(IpAddr::V4(b))) => a.octets()[..3] == b.octets()[..3],
+        (Ok(IpAddr::V6(a)), Ok(IpAddr::V6(b))) => a.octets()[..6] == b.octets()[..6],
+        // Не разобрали — сравниваем как есть: лучше строгое сравнение, чем
+        // выдуманное послабление.
+        _ => a == b,
+    }
 }
 
 async fn check() -> Result<()> {
@@ -894,18 +923,29 @@ async fn check() -> Result<()> {
     };
 
     match settings.mode {
-        ConnectionMode::Tunnel => {
-            if direct_ip.as_ref() == Some(tunnelled) {
+        ConnectionMode::Tunnel => match direct_ip.as_deref() {
+            Some(direct) if same_exit(direct, tunnelled) => {
                 println!("Режим туннеля: весь трафик идёт через сервер. Всё в порядке.");
-            } else {
+                if direct != tunnelled {
+                    println!(
+                        "Адреса разные ({direct} и {tunnelled}), но выход один: \
+                         провайдер сервера отвечает с нескольких адресов подсети."
+                    );
+                }
+            }
+            Some(_) => {
                 println!("Режим туннеля, но обычный трафик идёт мимо сервера.");
                 println!("Похоже, маршрут по умолчанию удерживает кто-то ещё.");
                 std::process::exit(1);
             }
-        }
+            None => println!("Прямой путь не ответил — судить о нём нечем."),
+        },
         ConnectionMode::Proxy => {
             println!("Режим прокси: через сервер идут только приложения, знающие о прокси.");
-            if direct_ip.is_some() && direct_ip.as_ref() != Some(tunnelled) {
+            if direct_ip
+                .as_deref()
+                .is_some_and(|direct| !same_exit(direct, tunnelled))
+            {
                 println!(
                     "Это ожидаемо и не является неисправностью: {} — ваш обычный адрес,",
                     direct_ip.as_deref().unwrap_or("")
@@ -1399,4 +1439,38 @@ async fn firewall_reset() -> Result<()> {
     )?;
     println!("Фильтры сняты, трафик идёт напрямую.");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::same_exit;
+
+    #[test]
+    fn one_provider_with_several_addresses_is_one_exit() {
+        // Ровно тот случай, на котором проверка объявляла исправный туннель
+        // дырявым: оба ответа пришли от одного провайдера, просто с разных
+        // адресов его подсети.
+        assert!(same_exit("152.233.35.212", "152.233.35.206"));
+        assert!(same_exit("152.233.35.212", "152.233.35.212"));
+    }
+
+    #[test]
+    fn a_real_leak_is_still_a_leak() {
+        // Домашний адрес и адрес сервера в одной /24 не окажутся.
+        assert!(!same_exit("152.233.35.212", "95.24.180.11"));
+        assert!(!same_exit("152.233.35.212", "152.233.36.212"));
+    }
+
+    #[test]
+    fn unparsed_answers_are_compared_as_they_came() {
+        // Сервис ответил не адресом — выдумывать послабление не на чем.
+        assert!(same_exit("что-то не то", "что-то не то"));
+        assert!(!same_exit("что-то не то", "и вовсе другое"));
+    }
+
+    #[test]
+    fn the_sixth_generation_of_addresses_counts_by_prefix() {
+        assert!(same_exit("2a03:2880:f12f:83:face:b00c::25de", "2a03:2880:f12f:83::1"));
+        assert!(!same_exit("2a03:2880:f12f:83::1", "2a03:2880:aaaa:83::1"));
+    }
 }

@@ -17,8 +17,9 @@
     border-radius: 4px;
     background: var(--accent);
     color: var(--on-accent);
+    /* Светлое на тёмном кажется жирнее — ступень вниз выравнивает. */
+    font-weight: calc(500 + var(--on-accent-weight));
     font-size: 9px;
-    font-weight: 500;
     line-height: 120%;
     text-align: center;
   }

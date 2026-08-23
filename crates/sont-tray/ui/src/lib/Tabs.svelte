@@ -94,7 +94,8 @@
 
   .label {
     font-size: 10px;
-    font-weight: 500;
+    /* Светлое на тёмном кажется жирнее — ступень вниз выравнивает. */
+    font-weight: calc(500 + var(--on-accent-weight));
     line-height: 120%;
   }
 </style>

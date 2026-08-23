@@ -45,5 +45,7 @@
   .active {
     background: var(--accent);
     color: var(--on-accent);
+    /* Светлое на тёмном кажется жирнее — ступень вниз выравнивает. */
+    font-weight: calc(500 + var(--on-accent-weight));
   }
 </style>

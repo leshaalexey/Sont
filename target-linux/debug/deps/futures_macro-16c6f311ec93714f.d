@@ -1,0 +1,9 @@
+C:\Users\ALavrinenko\Beauty\Software\Sont\target-linux\debug\deps\futures_macro-16c6f311ec93714f.d: C:\Users\ALavrinenko\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.34\src\lib.rs C:\Users\ALavrinenko\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.34\src\executor.rs C:\Users\ALavrinenko\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.34\src\join.rs C:\Users\ALavrinenko\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.34\src\select.rs C:\Users\ALavrinenko\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.34\src\stream_select.rs
+
+C:\Users\ALavrinenko\Beauty\Software\Sont\target-linux\debug\deps\futures_macro-16c6f311ec93714f.dll: C:\Users\ALavrinenko\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.34\src\lib.rs C:\Users\ALavrinenko\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.34\src\executor.rs C:\Users\ALavrinenko\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.34\src\join.rs C:\Users\ALavrinenko\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.34\src\select.rs C:\Users\ALavrinenko\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.34\src\stream_select.rs
+
+C:\Users\ALavrinenko\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.34\src\lib.rs:
+C:\Users\ALavrinenko\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.34\src\executor.rs:
+C:\Users\ALavrinenko\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.34\src\join.rs:
+C:\Users\ALavrinenko\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.34\src\select.rs:
+C:\Users\ALavrinenko\.cargo\registry\src\index.crates.io-1949cf8c6b5b557f\futures-macro-0.3.34\src\stream_select.rs:

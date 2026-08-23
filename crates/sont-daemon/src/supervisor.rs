@@ -47,6 +47,13 @@ const HEALTH_INTERVAL: Duration = Duration::from_secs(30);
 /// неё значит рвать рабочее соединение на ровном месте.
 const HEALTH_FAILURES_BEFORE_RECONNECT: u32 = 2;
 
+/// Как часто демон возвращается к соединению, которого добивается, но не имеет.
+///
+/// Пятнадцать секунд: достаточно редко, чтобы не долбиться в заведомо
+/// неподнимающийся туннель, и достаточно часто, чтобы пользователь, добавивший
+/// ключ или починивший сеть, не успел заметить паузу.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
+
 /// Потолок паузы между попытками переподключения.
 const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
 
@@ -262,6 +269,12 @@ pub struct Supervisor {
     /// Когда в последний раз проверяли живость.
     last_health_check: Instant,
 
+    /// Когда демон в последний раз пробовал поднять соединение.
+    ///
+    /// Нужно примирителю: без отметки он бился бы в неподнимающийся туннель
+    /// каждую секунду.
+    last_attempt: Instant,
+
     /// Поднятая блокировка трафика, если kill-switch включён.
     ///
     /// Наличие значения — единственный источник правды для поля `blocked` в
@@ -383,6 +396,8 @@ impl Supervisor {
             reconnect_attempt: 0,
             health_failures: 0,
             last_health_check: Instant::now(),
+            // В прошлом, чтобы первая же попытка примирителя не ждала паузу.
+            last_attempt: Instant::now() - RECONCILE_INTERVAL,
             firewall: None,
         }
     }
@@ -461,6 +476,10 @@ impl Supervisor {
                     self.supervise();
                     self.tick_stats();
                     self.tick_probe();
+                    // Примиритель последним: ему нужно уже поправленное
+                    // надзором состояние, иначе он полезет поднимать то, что
+                    // как раз восстанавливается.
+                    self.tick_reconcile();
                 }
             }
         }
@@ -957,6 +976,13 @@ impl Supervisor {
         // сразу, а не через интервал: автовыбор и переключение при падении
         // без свежих чисел работают вслепую.
         self.begin_probe(None);
+
+        // Серверы появились там, где их не было. Если демон всё это время
+        // добивался соединения — а он добивается, когда включено
+        // автоподключение, — поднимать его надо сейчас, а не через паузу
+        // примирителя: пользователь только что вставил ключ и смотрит на окно.
+        self.last_attempt = Instant::now() - RECONCILE_INTERVAL;
+        self.tick_reconcile();
     }
 
     fn patch_settings(&mut self, patch: SettingsPatch) -> Response {
@@ -1019,12 +1045,28 @@ impl Supervisor {
     // ─────────────────────────── переходы ───────────────────────────
 
     fn begin_connect(&mut self, explicit: Option<ProfileId>) -> Result<(), TunnelError> {
-        let id = self.select_server(explicit.clone())?;
+        let selected = self.select_server(explicit.clone());
 
-        // Намерение пользователя запоминаем до всех проверок: даже если эта
-        // попытка не удастся, демон должен продолжать добиваться соединения.
-        self.desired = Desired::Connected { server: explicit };
-        self.reconnect_attempt = 0;
+        // Намерение пользователя запоминаем до всех проверок — и даже когда
+        // проверка не прошла.
+        //
+        // Серверов может не быть прямо сейчас: демон только запустился, ключ
+        // ещё не введён. Сдаться в этот момент значит остаться отключённым
+        // навсегда, пока пользователь не нажмёт кнопку — а он уже сказал, чего
+        // хочет, включив автоподключение. С сохранённым намерением соединение
+        // поднимется само, как только появится на чём.
+        //
+        // Исключение — несуществующий сервер: добиваться того, чего нет в
+        // списке, демон будет вечно и безрезультатно.
+        if !matches!(selected, Err(TunnelError::UnknownServer { .. })) {
+            self.desired = Desired::Connected {
+                server: explicit.clone(),
+            };
+            self.reconnect_attempt = 0;
+            self.last_attempt = Instant::now();
+        }
+
+        let id = selected?;
 
         self.set_state(TunnelState::Connecting {
             server: id.clone(),
@@ -1502,7 +1544,21 @@ impl Supervisor {
     /// Используется там, где повторять попытку заведомо бесполезно: демон
     /// перестаёт бороться, а пользователь получает причину.
     fn fail(&mut self, error: TunnelError) {
-        self.desired = Desired::Disconnected;
+        // Намерение снимается не всегда.
+        //
+        // Причина отказа бывает внешней и поправимой без участия демона: нет
+        // ключа — его добавят, нет серверов — придёт подписка, кончились
+        // попытки — вернётся сеть. Сдаться в таких случаях навсегда значит
+        // оставить пользователя отключённым до тех пор, пока он не заметит
+        // это сам и не нажмёт кнопку. Намерение остаётся, а примиритель
+        // вернётся к нему, когда будет с чем работать.
+        //
+        // А вот незапускающееся ядро — отсутствующий файл, несошедшийся хэш,
+        // неподдерживаемый протокол — само не починится, и повторять тут
+        // нечего.
+        if matches!(error, TunnelError::CoreStartFailed { .. }) {
+            self.desired = Desired::Disconnected;
+        }
         self.reconnect_attempt = 0;
 
         // В режиме lockdown блокировка остаётся: соединение не поднялось,
@@ -1516,6 +1572,48 @@ impl Supervisor {
 
         let blocked = self.firewall.is_some();
         self.set_state(TunnelState::Failed { error, blocked });
+    }
+
+    /// Возвращает соединение, которого демон добивается, но не имеет.
+    ///
+    /// # Зачем отдельно от восстановления
+    ///
+    /// Восстановление ([`Self::begin_reconnect`]) — ответ на обрыв уже
+    /// работавшего соединения, и оно исчерпаемо: бюджет попыток кончается,
+    /// демон объявляет отказ. Здесь наоборот — состояние, а не событие:
+    /// пользователь хочет соединения, соединения нет, и всё, что нужно, —
+    /// периодически проверять, не появилось ли то, чего не хватало.
+    ///
+    /// Именно это делает добавление первого ключа самодостаточным. Демон
+    /// стартовал без подписки, автоподключение не удалось, намерение
+    /// осталось; ключ добавлен — подписка прочитана — серверы появились, и
+    /// соединение поднимается само, без единого нажатия.
+    fn tick_reconcile(&mut self) {
+        if !matches!(self.desired, Desired::Connected { .. }) {
+            return;
+        }
+        // Что-то уже происходит: подключаемся, восстанавливаемся, отключаемся.
+        if self.state.holds_a_route() || matches!(self.state, TunnelState::Disconnecting) {
+            return;
+        }
+        if self.last_attempt.elapsed() < RECONCILE_INTERVAL {
+            return;
+        }
+        // Пробовать не на чем — молча ждём дальше. Писать в журнал каждые
+        // пятнадцать секунд «серверов нет» бессмысленно: это не событие.
+        if self.candidates().next().is_none() {
+            return;
+        }
+
+        let pinned = match &self.desired {
+            Desired::Connected { server } => server.clone(),
+            Desired::Disconnected => None,
+        };
+
+        tracing::info!("соединения нет, а оно нужно — пробую поднять");
+        if let Err(e) = self.begin_connect(pinned) {
+            tracing::warn!(error = %e, "попытка не удалась, вернусь позже");
+        }
     }
 
     /// Надзор за поднятым соединением.
@@ -2078,13 +2176,39 @@ async fn start_core(
     //
     // Адрес сервера обязан идти мимо туннеля, иначе подключение ядра к нему
     // замкнётся само на себя.
-    let bypass = resolve_bypass(&profile.endpoint.host);
+    let mut bypass = resolve_bypass(&profile.endpoint.host);
     if bypass.is_empty() {
         core.shutdown().await;
         return Err(TunnelError::NetworkSetupFailed {
             detail: format!("не удалось определить адрес сервера {}", profile.endpoint.host),
         });
     }
+
+    // Сайты из исключений — тоже отдельными маршрутами.
+    //
+    // Одного правила в ядре для них мало, и это не недосмотр, а устройство
+    // режима туннеля. Маршрут по умолчанию ведёт в TUN, значит пакет к
+    // сайту попадает в туннель ещё до того, как ядро вообще увидит
+    // соединение. Ядро честно отправит его в `direct` — обычным сокетом,
+    // пакеты которого снова пойдут по маршруту по умолчанию, то есть опять в
+    // TUN. Получается петля, а не прямой доступ.
+    //
+    // Единственный способ вывести адрес из туннеля — не пускать его туда:
+    // отдельный маршрут через физический шлюз, ровно как для самого
+    // VPN-сервера.
+    for host in bypass_hosts(settings) {
+        let ips = resolve_bypass(host);
+        if ips.is_empty() {
+            // Не повод отменять подключение: один неразрешившийся домен из
+            // списка исключений — это потеря одного исключения, а не связи.
+            tracing::warn!(%host, "исключение не добавлено: имя не разрешилось");
+            continue;
+        }
+        tracing::info!(%host, addresses = ips.len(), "исключение уходит мимо туннеля");
+        bypass.extend(ips);
+    }
+    bypass.sort();
+    bypass.dedup();
 
     let tunnel = match crate::tunnel::Tunnel::start(crate::tunnel::TunnelConfig {
         socks,
@@ -2158,6 +2282,23 @@ async fn shutdown_started(started: Started) {
 /// Для доменного имени берём все адреса, которые вернул резолвер: сервер может
 /// отвечать с нескольких, и пропустить хотя бы один значит получить петлю при
 /// следующем переподключении.
+/// Какие сайты в режиме туннеля надо вывести отдельными маршрутами.
+///
+/// Только режим `Exclude`: там перечислено то, что идёт мимо туннеля, и это
+/// прямо ложится на маршруты. В `Include` перечислено обратное — что идёт
+/// **через** туннель, — а «всё остальное мимо» маршрутами не выразить: список
+/// адресов интернета конечным не бывает.
+///
+/// Список программ сюда не попадает и попасть не может: маршрут выбирается по
+/// адресу назначения, а не по тому, кто отправитель. Для программ работает
+/// только режим прокси.
+fn bypass_hosts(settings: &Settings) -> &[String] {
+    match settings.split_tunnel.mode {
+        sont_core::SplitTunnelMode::Exclude => &settings.split_tunnel.sites,
+        _ => &[],
+    }
+}
+
 fn resolve_bypass(host: &str) -> Vec<std::net::IpAddr> {
     use std::net::ToSocketAddrs;
 
@@ -2234,7 +2375,10 @@ const PROBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
 /// туннель. Запрос к домену тогда упирается в DNS и не выполняется вовсе — а
 /// прошлая версия проверки не отличала «не получил ответа» от «получил другой
 /// адрес» и в обоих случаях винила посторонний VPN-клиент.
-const IP_ECHO_URL: &str = "https://1.1.1.1/cdn-cgi/trace";
+/// Тот же адрес, что загоняется в туннель правилом маршрутизации ядра:
+/// разъедься они — и проверка пошла бы мимо туннеля, подтверждая работу
+/// того, чего нет.
+const IP_ECHO_URL: &str = sont_xray::config::HEALTH_CHECK_URL;
 
 /// Достаёт внешний адрес из ответа вида `ip=203.0.113.5`.
 fn parse_echoed_ip(body: &str) -> Option<String> {
@@ -3843,17 +3987,130 @@ mod tests {
 
     #[tokio::test]
     async fn unrecoverable_error_stops_the_attempts() {
-        // Отсутствующая подписка от повторов не появится, а бесконечный цикл
-        // попыток скрыл бы от пользователя настоящую причину.
+        // Незапускающееся ядро — отсутствующий файл, несошедшийся хэш — само
+        // не починится, и бесконечный цикл попыток скрыл бы от пользователя
+        // настоящую причину.
         let (mut sup, _dir) = make(false);
         sup.desired = Desired::Connected { server: None };
+        sup.handle_internal(Internal::CoreStarted {
+            generation: sup.generation,
+            result: Box::new(Err(TunnelError::CoreStartFailed {
+                detail: "файла ядра нет".into(),
+            })),
+        });
+
+        assert_eq!(sup.state.kind(), "failed");
+        assert_eq!(sup.desired, Desired::Disconnected);
+    }
+
+    #[test]
+    fn only_excluded_sites_become_routes() {
+        use sont_core::{SplitTunnelMode, SplitTunnelRules};
+
+        // В режиме `Exclude` перечислено то, что идёт мимо туннеля, — это и
+        // ложится на маршруты.
+        let mut settings = Settings {
+            split_tunnel: SplitTunnelRules {
+                mode: SplitTunnelMode::Exclude,
+                apps: vec![r"C:\browser.exe".into()],
+                sites: vec!["bank.example".into()],
+            },
+            ..Default::default()
+        };
+        assert_eq!(bypass_hosts(&settings), ["bank.example"]);
+
+        // В `Include` перечислено обратное — что идёт через туннель. «Всё
+        // остальное мимо» маршрутами не выразить.
+        settings.split_tunnel.mode = SplitTunnelMode::Include;
+        assert!(bypass_hosts(&settings).is_empty());
+
+        settings.split_tunnel.mode = SplitTunnelMode::Off;
+        assert!(bypass_hosts(&settings).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_missing_key_does_not_cancel_the_intent() {
+        // Подписки нет — но она появится, как только пользователь вставит
+        // ключ. Снять намерение здесь значит оставить его отключённым до
+        // тех пор, пока он сам не заметит и не нажмёт кнопку.
+        let (mut sup, _dir) = make(false);
+        sup.desired = Desired::Connected { server: None };
+
         sup.handle_internal(Internal::CoreStarted {
             generation: sup.generation,
             result: Box::new(Err(TunnelError::NoSubscription)),
         });
 
         assert_eq!(sup.state.kind(), "failed");
-        assert_eq!(sup.desired, Desired::Disconnected);
+        assert_eq!(
+            sup.desired,
+            Desired::Connected { server: None },
+            "намерение должно пережить поправимый отказ"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_first_key_brings_the_connection_up_by_itself() {
+        // Ровно тот случай, ради которого заведён примиритель: демон
+        // стартовал без подписки, автоподключение не удалось, намерение
+        // осталось. Ключ добавлен — соединение поднимается само.
+        let (mut sup, _dir) = make(false);
+        assert!(sup.begin_connect(None).is_err(), "подключаться пока не на чем");
+        assert_eq!(sup.state.kind(), "disconnected");
+
+        sup.handle(Request::AddSubscription {
+            url: Secret::new("https://panel.example/sub/KEY"),
+        });
+        let id = sup.subscriptions[0].id.clone();
+
+        // Ответ панели: демо-серверы годятся как разобранная подписка.
+        sup.apply_fetched(
+            id,
+            Ok(crate::subscription::Fetched {
+                profiles: demo::servers(),
+                info: Default::default(),
+                skipped: 0,
+            }),
+        );
+
+        assert_eq!(
+            sup.state.kind(),
+            "connecting",
+            "серверы появились — соединение должно подниматься без нажатий"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_reconciler_does_not_hammer_a_dead_connection() {
+        // Между попытками выдерживается пауза: иначе демон бился бы в
+        // неподнимающийся туннель каждую секунду тика.
+        let (mut sup, _dir) = make(true);
+        sup.desired = Desired::Connected { server: None };
+        sup.set_state(TunnelState::Failed {
+            error: TunnelError::RetriesExhausted { attempts: 3 },
+            blocked: false,
+        });
+        sup.last_attempt = Instant::now();
+
+        sup.tick_reconcile();
+        assert_eq!(sup.state.kind(), "failed", "пауза ещё не вышла");
+
+        sup.last_attempt = Instant::now() - RECONCILE_INTERVAL;
+        sup.tick_reconcile();
+        assert_eq!(sup.state.kind(), "connecting");
+    }
+
+    #[tokio::test]
+    async fn the_reconciler_leaves_a_disconnected_user_alone() {
+        // Пользователь отключился сам — навязывать ему соединение обратно
+        // демон не вправе.
+        let (mut sup, _dir) = make(true);
+        sup.desired = Desired::Disconnected;
+        sup.last_attempt = Instant::now() - RECONCILE_INTERVAL;
+
+        sup.tick_reconcile();
+
+        assert_eq!(sup.state.kind(), "disconnected");
     }
 
     #[tokio::test]

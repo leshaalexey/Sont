@@ -130,17 +130,28 @@ pub struct SplitTunnelRules {
     /// правила настоящего браузера.
     #[serde(default)]
     pub apps: Vec<String>,
+    /// Домены сайтов — без схемы и пути: `example.com`.
+    ///
+    /// Отдельно от программ, потому что это другое правило маршрутизации.
+    /// «Пустить мимо туннеля браузер» и «пустить мимо туннеля один сайт» —
+    /// разные желания, и второе обычно и есть настоящее: банк не пускает с
+    /// иностранного адреса не браузер, а именно свой сайт.
+    #[serde(default)]
+    pub sites: Vec<String>,
 }
 
 impl SplitTunnelRules {
     /// Действуют ли правила на самом деле.
     ///
-    /// Пустой список в режиме `Include` означал бы «весь трафик мимо туннеля»,
-    /// то есть выключенный VPN. Такую конфигурацию считаем неактивной.
+    /// Пустые списки в режиме `Include` означали бы «весь трафик мимо
+    /// туннеля», то есть выключенный VPN. Такую конфигурацию считаем
+    /// неактивной.
     pub fn is_active(&self) -> bool {
         match self.mode {
             SplitTunnelMode::Off => false,
-            SplitTunnelMode::Exclude | SplitTunnelMode::Include => !self.apps.is_empty(),
+            SplitTunnelMode::Exclude | SplitTunnelMode::Include => {
+                !self.apps.is_empty() || !self.sites.is_empty()
+            }
         }
     }
 }
@@ -467,6 +478,7 @@ mod tests {
             split_tunnel: Some(SplitTunnelRules {
                 mode: SplitTunnelMode::Exclude,
                 apps: vec!["C:\\Program Files\\App\\app.exe".into()],
+                sites: Vec::new(),
             }),
             ..Default::default()
         }
@@ -509,6 +521,7 @@ mod tests {
         let rules = SplitTunnelRules {
             mode: SplitTunnelMode::Include,
             apps: vec![],
+            sites: vec![],
         };
         assert!(
             !rules.is_active(),

@@ -33,9 +33,21 @@ tauri-plugin-opener = "2"
 tauri-plugin-single-instance = "2"
 
 [target.'cfg(windows)'.dependencies]
+# Адрес открытой страницы достаётся через UI Automation, а это COM. У
+# `windows-sys` интерфейсы голые, вызов каждого метода — ручная диспетчеризация
+# по таблице; `windows` даёт те же биндинги обёрнутыми. Версия уже в дереве как
+# зависимость Tauri, так что лишней сборки не добавляет.
+windows = { version = "0.61", features = [
+    "Win32_System_Com",
+    "Win32_System_Variant",
+    "Win32_UI_Accessibility",
+] }
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_Graphics_Gdi",
     "Win32_System_Services",
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
