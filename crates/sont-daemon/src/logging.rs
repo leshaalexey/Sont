@@ -174,8 +174,37 @@ pub fn init_to_file(default_level: &str, dir: &std::path::Path) -> (LogBuffer, W
     (buffer, guard)
 }
 
+/// Сетевой слой пишет строку на каждое соединение — это надо приглушить.
+///
+/// `tun2proxy` и его `ipstack` сообщают о начале и конце **каждой** сессии, а
+/// сессией у них считается и одиночный UDP-пакет. За сутки это дало сорок три
+/// мегабайта журнала, в которых утонуло всё остальное: чтобы найти в нём
+/// причину отказа, пришлось отфильтровывать девяносто девять процентов строк.
+/// Журнал, в котором нельзя ничего найти, не выполняет своего единственного
+/// назначения.
+///
+/// Их собственная настройка подробности тут не помогает: они пишут через
+/// `tracing`, и уровень им задаёт наш подписчик, а не переданный им аргумент.
+///
+/// Предупреждения и ошибки остаются: именно они и нужны.
+const NOISY: [&str; 2] = ["tun2proxy=warn", "ipstack=warn"];
+
 fn filter(default_level: &str) -> EnvFilter {
-    EnvFilter::try_from_env("SONT_LOG").unwrap_or_else(|_| EnvFilter::new(default_level))
+    // Своё значение из переменной окружения уважаем целиком: если человек
+    // просит подробностей от сетевого слоя, он их и получает.
+    if let Ok(explicit) = EnvFilter::try_from_env("SONT_LOG") {
+        return explicit;
+    }
+
+    let mut filter = EnvFilter::new(default_level);
+    for directive in NOISY {
+        // Разбор константы не может не удаться, но паниковать из-за журнала
+        // всё равно незачем.
+        if let Ok(parsed) = directive.parse() {
+            filter = filter.add_directive(parsed);
+        }
+    }
+    filter
 }
 
 #[cfg(test)]
