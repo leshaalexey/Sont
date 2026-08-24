@@ -495,16 +495,18 @@ mod platform {
     }
 }
 
-#[cfg(not(windows))]
+/// Настройки прокси на macOS.
+///
+/// Задаются `networksetup` и требуют прав администратора и имени сетевой
+/// службы — ни того, ни другого у агента сеанса нет. Пока честная заглушка.
+#[cfg(all(unix, target_os = "macos"))]
 mod platform {
     use std::io;
 
-    /// На macOS настройки прокси задаются через `networksetup`, на Linux —
-    /// зависят от окружения рабочего стола и единого места не имеют.
     pub fn apply(_endpoints: &super::Endpoints) -> io::Result<()> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
-            "автоматическая настройка прокси на этой платформе не реализована",
+            "автоматическая настройка прокси на macOS не реализована",
         ))
     }
 
@@ -515,6 +517,217 @@ mod platform {
     pub fn current() -> Option<(bool, String)> {
         None
     }
+}
+
+/// Настройки прокси на Linux.
+///
+/// # Почему тут два способа, а не один
+///
+/// Единого места для настроек прокси в Linux нет — и это не оплошность
+/// разработчиков, а следствие устройства системы: рабочий стол здесь сменный.
+/// Приходится объявлять прокси там, куда смотрят разные семейства программ.
+///
+/// **`gsettings`** — настройки GNOME. Их читает не только сам GNOME: Chrome,
+/// Chromium и всё на Electron спрашивают именно их, независимо от того, какой
+/// рабочий стол запущен. Это тот же слой, что `Internet Settings` на Windows,
+/// и покрывает он то же самое — браузеры.
+///
+/// **`~/.config/environment.d`** — переменные окружения для служб сеанса
+/// systemd. Их видят программы, запущенные после записи: `curl`, `git`, Node,
+/// Python — весь мир соглашения `http_proxy`. Ровно та же роль, что у
+/// переменных окружения на Windows, и ровно та же оговорка: уже запущенные
+/// программы своё окружение не перечитывают.
+///
+/// # Чего здесь нет
+///
+/// KDE держит настройки в `kioslaverc` и требует уведомления по D-Bus, чтобы
+/// их перечитали. Это отдельная реализация, и писать её вслепую, без KDE под
+/// рукой, значит выдать непроверенный код за работающий. Пока — не сделано.
+#[cfg(all(unix, not(target_os = "macos")))]
+mod platform {
+    use std::io;
+    use std::process::Command;
+
+    /// Ветка настроек GNOME, откуда прокси читают браузеры.
+    const SCHEMA: &str = "org.gnome.system.proxy";
+
+    /// Файл переменных окружения для сеанса systemd.
+    ///
+    /// Отдельный файл, а не правка общего: так снятие настроек — это удаление
+    /// одного файла, и чужие переменные при этом заведомо не пострадают.
+    const ENV_FILE: &str = "sont-proxy.conf";
+
+    pub fn apply(endpoints: &super::Endpoints) -> io::Result<()> {
+        let (host, port) = super::split_endpoint(&endpoints.http)?;
+
+        // Порядок важен: сначала адреса, потом режим. Включённый режим с
+        // ещё не записанным адресом — это несколько миллисекунд, в которые
+        // браузер ходит через прокси на нулевой порт.
+        for scheme in ["http", "https"] {
+            gsettings(&[
+                "set",
+                &format!("{SCHEMA}.{scheme}"),
+                "host",
+                host,
+            ])?;
+            gsettings(&[
+                "set",
+                &format!("{SCHEMA}.{scheme}"),
+                "port",
+                &port.to_string(),
+            ])?;
+        }
+
+        gsettings(&["set", SCHEMA, "ignore-hosts", &super::gnome_ignore_list()])?;
+        gsettings(&["set", SCHEMA, "mode", "manual"])?;
+
+        // Переменные окружения — отдельно и не смертельно: если каталога
+        // сеанса нет, браузеры всё равно уже настроены.
+        if let Err(e) = write_env(&endpoints.http) {
+            tracing::warn!(error = %e, "переменные окружения прокси не записаны");
+        }
+        Ok(())
+    }
+
+    pub fn clear() -> io::Result<()> {
+        // Режим первым: он один определяет, пойдёт ли трафик через прокси, и
+        // снять его важнее, чем прибрать адреса.
+        let mode = gsettings(&["set", SCHEMA, "mode", "none"]);
+        let env = remove_env();
+
+        if let Err(e) = &env {
+            tracing::warn!(error = %e, "не удалось убрать переменные окружения прокси");
+        }
+        mode
+    }
+
+    pub fn current() -> Option<(bool, String)> {
+        let mode = read(&["get", SCHEMA, "mode"])?;
+        let on = mode.trim().trim_matches('\'') == "manual";
+
+        let host = read(&["get", &format!("{SCHEMA}.http"), "host"])?;
+        let port = read(&["get", &format!("{SCHEMA}.http"), "port"])?;
+        let host = host.trim().trim_matches('\'').to_owned();
+        let port = port.trim();
+        if host.is_empty() {
+            return None;
+        }
+
+        // Формат тот же, что читает диагностика на Windows: `http=адрес:порт`.
+        Some((on, format!("http={host}:{port}")))
+    }
+
+    fn gsettings(args: &[&str]) -> io::Result<()> {
+        let status = Command::new("gsettings").args(args).status().map_err(|e| {
+            io::Error::new(
+                io::ErrorKind::Unsupported,
+                format!(
+                    "не удалось запустить gsettings ({e}); \
+                     задайте прокси в настройках рабочего стола вручную"
+                ),
+            )
+        })?;
+
+        if status.success() {
+            return Ok(());
+        }
+        Err(io::Error::other(format!(
+            "gsettings отказал: {}",
+            args.join(" ")
+        )))
+    }
+
+    fn read(args: &[&str]) -> Option<String> {
+        let out = Command::new("gsettings").args(args).output().ok()?;
+        out.status
+            .success()
+            .then(|| String::from_utf8_lossy(&out.stdout).into_owned())
+    }
+
+    /// Каталог переменных окружения сеанса.
+    fn env_dir() -> Option<std::path::PathBuf> {
+        let base = std::env::var_os("XDG_CONFIG_HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".config")))?;
+        Some(base.join("environment.d"))
+    }
+
+    fn write_env(endpoint: &str) -> io::Result<()> {
+        let dir = env_dir().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, "не найден домашний каталог")
+        })?;
+        std::fs::create_dir_all(&dir)?;
+
+        let url = format!("http://{endpoint}");
+        let no_proxy = super::NO_PROXY;
+        // И в верхнем, и в нижнем регистре: часть программ читает только
+        // одно написание, и какое именно — зависит от программы.
+        let body = format!(
+            "# Создано Sont. Файл удаляется при отключении.\n\
+             HTTP_PROXY={url}\nHTTPS_PROXY={url}\nNO_PROXY={no_proxy}\n\
+             http_proxy={url}\nhttps_proxy={url}\nno_proxy={no_proxy}\n"
+        );
+        std::fs::write(dir.join(ENV_FILE), body)
+    }
+
+    fn remove_env() -> io::Result<()> {
+        let Some(dir) = env_dir() else {
+            return Ok(());
+        };
+        match std::fs::remove_file(dir.join(ENV_FILE)) {
+            Ok(()) => Ok(()),
+            // Файла нет — значит и убирать нечего.
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Делит `адрес:порт`.
+///
+/// Живёт снаружи платформенного модуля, чтобы проверяться тестами на любой
+/// системе: ошибка тут — это прокси на нулевом порту, то есть молча пропавший
+/// интернет, а такое нельзя проверять только на той машине, где собирают.
+///
+/// В сборке под Windows вызывается только из тестов — оттого и разрешение.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn split_endpoint(endpoint: &str) -> std::io::Result<(&str, u16)> {
+    let (host, port) = endpoint.rsplit_once(':').ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("адрес прокси без порта: {endpoint}"),
+        )
+    })?;
+    let port: u16 = port.parse().map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("порт прокси не число: {port}"),
+        )
+    })?;
+    if host.is_empty() || port == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("пустой адрес прокси: {endpoint}"),
+        ));
+    }
+    Ok((host, port))
+}
+
+/// Список исключений в том виде, который понимает GNOME.
+///
+/// Набор тот же, что и для переменных окружения, а синтаксис свой: массив
+/// строк в одинарных кавычках. Ошибка формата тут не заметна на глаз —
+/// `gsettings` примет строку и просто не станет никого исключать.
+///
+/// В сборке под Windows вызывается только из тестов — оттого и разрешение.
+#[cfg_attr(windows, allow(dead_code))]
+pub(crate) fn gnome_ignore_list() -> String {
+    let list = NO_PROXY
+        .split(',')
+        .map(|entry| format!("'{}'", entry.trim()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("[{list}]")
 }
 
 /// Прописывает прокси в настройки текущего пользователя.
@@ -735,5 +948,42 @@ mod tests {
         // Отключение может произойти без предшествующего включения — например,
         // после перезапуска клиента. Ошибкой это быть не должно.
         assert!(clear().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod unix_helpers_tests {
+    use super::{gnome_ignore_list, split_endpoint};
+
+    #[test]
+    fn an_endpoint_splits_into_host_and_port() {
+        let (host, port) = split_endpoint("127.0.0.1:18966").unwrap();
+        assert_eq!(host, "127.0.0.1");
+        assert_eq!(port, 18966);
+    }
+
+    #[test]
+    fn a_broken_endpoint_is_refused_rather_than_guessed() {
+        // Прокси на нулевом порту — это молча пропавший интернет: браузер
+        // честно пойдёт по указанному адресу, где никого нет. Лучше отказ.
+        assert!(split_endpoint("127.0.0.1").is_err(), "без порта");
+        assert!(split_endpoint("127.0.0.1:").is_err(), "порт пустой");
+        assert!(split_endpoint("127.0.0.1:0").is_err(), "нулевой порт");
+        assert!(split_endpoint(":18966").is_err(), "адрес пустой");
+        assert!(split_endpoint("127.0.0.1:не число").is_err());
+    }
+
+    #[test]
+    fn the_ignore_list_is_a_gnome_array() {
+        let list = gnome_ignore_list();
+        assert!(list.starts_with('[') && list.ends_with(']'), "{list}");
+        assert!(list.contains("'localhost'"), "{list}");
+        assert!(list.contains("'192.168.0.0/16'"), "{list}");
+        // Каждый элемент — строка в кавычках без пробелов внутри: лишний
+        // пробел gsettings проглотит молча, а исключать перестанет.
+        for entry in list.trim_matches(['[', ']']).split(", ") {
+            assert!(entry.starts_with('\x27') && entry.ends_with('\x27'), "{entry}");
+            assert!(!entry.trim_matches('\x27').contains(' '), "{entry}");
+        }
     }
 }

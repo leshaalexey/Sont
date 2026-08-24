@@ -1348,7 +1348,14 @@ async fn apply_system_proxy_if_needed(client: &Client) {
             let _ = client.request(Request::ProxyAnnounced).await;
 
             println!("Системный прокси включён: HTTP {}", proxy.http);
-            println!("Прописан и в настройки Windows, и в HTTP_PROXY/HTTPS_PROXY.");
+            // Мест, куда прописан прокси, на разных системах разные, и назвать
+            // чужие — значит послать пользователя искать их там, где их нет.
+            if cfg!(windows) {
+                println!("Прописан и в настройки Windows, и в HTTP_PROXY/HTTPS_PROXY.");
+            } else {
+                println!("Прописан в настройки рабочего стола (gsettings) и в переменные");
+                println!("окружения сеанса (~/.config/environment.d).");
+            }
             // SOCKS в системные настройки не попадает намеренно (см. sysproxy),
             // но он поднят, и приложению, которое настраивается вручную, он
             // нужен — поэтому адрес показываем.
