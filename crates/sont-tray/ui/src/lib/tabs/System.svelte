@@ -22,12 +22,29 @@
     { value: "ru", label: "RU" },
     { value: "en", label: "EN" },
   ];
+
+  // Порядок не алфавитный: «как в системе» стоит первым, потому что это
+  // значение по умолчанию, и с него начинается выбор. Дальше — от светлого к
+  // тёмному, как в самих параметрах Windows.
+  const THEMES = $derived([
+    { value: "system", label: $t("theme.system") },
+    { value: "light", label: $t("theme.light") },
+    { value: "dark", label: $t("theme.dark") },
+  ]);
 </script>
 
 <Section title={$t("sec.interface")} />
 
 <Row title={$t("lang.title")}>
   <Segmented options={LANGS} value={$settings.language} onselect={(v) => patch({ language: v })} />
+</Row>
+
+<Row title={$t("theme.title")}>
+  <Segmented
+    options={THEMES}
+    value={$settings.theme ?? "system"}
+    onselect={(v) => patch({ theme: v })}
+  />
 </Row>
 
 <Row title={$t("accent.title")} hint={$t("accent.hint")}>

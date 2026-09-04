@@ -81,13 +81,13 @@
           подтверждения выходит скачок раскладки. Ширина считается сама, так
           что перевод на любой язык её не сломает.
         -->
-        <button class="act" class:done={copied === sub.id} onclick={() => copy(sub)}>
+        <button class="act outlined" class:done={copied === sub.id} onclick={() => copy(sub)}>
           <span class="swap">
             <span class:muted={copied === sub.id}>{$t("btn.copy")}</span>
             <span class:muted={copied !== sub.id}>{$t("btn.copied")}</span>
           </span>
         </button>
-        <button class="act" onclick={() => act("remove_subscription", { id: sub.id })}>
+        <button class="act outlined" onclick={() => act("remove_subscription", { id: sub.id })}>
           {$t("btn.remove")}
         </button>
       </span>
@@ -124,14 +124,14 @@
     font-size: 9px;
     font-weight: 500;
     line-height: 125%;
-    color: var(--cream);
+    color: var(--fg);
   }
 
   .meta {
     font-size: 8px;
     font-weight: 350;
     line-height: 125%;
-    color: rgba(244, 237, 229, 0.55);
+    color: rgba(var(--fg-rgb), 0.55);
   }
 
   /* Полоска расхода рисуется только у подписок с лимитом: у безлимитной ей
@@ -142,7 +142,7 @@
     height: 2px;
     margin-top: 1px;
     border-radius: 2px;
-    background: rgba(244, 237, 229, 0.15);
+    background: rgba(var(--fg-rgb), 0.15);
     overflow: hidden;
   }
   .fill {
@@ -163,7 +163,7 @@
     border: 0;
     border-radius: 3px;
     background: transparent;
-    box-shadow: inset 0 0 0 0.5px rgba(244, 237, 229, 0.4);
+    box-shadow: inset 0 0 0 0.5px rgba(var(--fg-rgb), 0.4);
     color: var(--dim-1);
     font-family: inherit;
     font-size: 8px;

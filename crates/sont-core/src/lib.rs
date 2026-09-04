@@ -18,7 +18,7 @@ pub use profile::{CountryCode, Endpoint, ProfileId, ServerProfile, SubscriptionI
 pub use secret::Secret;
 pub use settings::{
     ApplyOutcome, ConnectionMode, DnsMode, DnsSettings, FirewallMode, Settings, SettingsPatch,
-    SplitTunnelMode, SplitTunnelRules,
+    SplitTunnelMode, SplitTunnelRules, Theme,
 };
 pub use state::{TunInfo, TunnelState};
 pub use stats::{ProbeResult, Stats, SubscriptionInfo};
@@ -45,4 +45,8 @@ pub use transport::{Security, Stream, Transport, TransportKind};
 /// * 4 — настройки дирижёра (интервал замеров, порог переключения, число
 ///   попыток), выдача ключа подписки по запросу и причина переподключения
 ///   «нашёлся сервер быстрее».
-pub const PROTOCOL_VERSION: u32 = 4;
+/// * 5 — тема окна в настройках и признак `permanent` у `CoreStartFailed`.
+///   Оба поля со значением по умолчанию, поэтому старый клиент разберёт
+///   ответ нового демона и наоборот; версия поднята потому, что смысл
+///   сообщений изменился, а не потому, что сломался их разбор.
+pub const PROTOCOL_VERSION: u32 = 5;

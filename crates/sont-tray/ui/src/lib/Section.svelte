@@ -50,6 +50,6 @@
     font-size: 8px;
     font-weight: 300;
     line-height: 100%;
-    color: rgba(244, 237, 229, 0.4);
+    color: rgba(var(--fg-rgb), 0.4);
   }
 </style>

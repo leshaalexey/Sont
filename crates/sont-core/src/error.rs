@@ -68,7 +68,34 @@ pub enum TunnelError {
     /// Запрошенного сервера нет в текущем списке.
     UnknownServer { id: String },
     /// Ядро не удалось запустить (нет бинаря, не сошёлся хэш, нет прав).
-    CoreStartFailed { detail: String },
+    ///
+    /// # Почему здесь флаг
+    ///
+    /// Под одним именем сходятся два разных случая, и путать их дорого.
+    ///
+    /// Первый — сломанная установка: бинаря нет, хэш не сошёлся, протокол
+    /// сервера ядру неизвестен. Повторять нечего, и демон обязан остановиться,
+    /// объяснив причину.
+    ///
+    /// Второй — неудача одной попытки: ядро запустилось и тут же вышло, потому
+    /// что порт ещё держит только что погашенный экземпляр, а TUN-адаптер не
+    /// успел освободиться. Это штатно случается при смене настроек, где новое
+    /// ядро поднимается сразу за старым, — и лечится одним повтором через
+    /// секунду.
+    ///
+    /// Пока флага не было, второй случай трактовался как первый: пользователь
+    /// менял настройку, соединение падало, а демон снимал намерение и больше
+    /// не пытался. Со стороны это выглядело так, будто настройка выключает VPN.
+    CoreStartFailed {
+        detail: String,
+        /// `true` — повторять бесполезно, нужна починка снаружи.
+        ///
+        /// `#[serde(default)]` не для совместимости версий, а по смыслу: не
+        /// разобрав признак, безопаснее считать отказ временным и продолжить
+        /// попытки, чем молча оставить пользователя без соединения.
+        #[serde(default)]
+        permanent: bool,
+    },
     /// Ядро запустилось, но туннель не поднялся за отведённое время.
     HandshakeTimeout { seconds: u64 },
     /// Не удалось применить сетевые настройки: TUN, маршруты, DNS, firewall.
@@ -86,10 +113,8 @@ impl TunnelError {
     /// ретрай бессмысленно и пользователя нужно попросить что-то сделать.
     pub fn is_retryable(&self) -> bool {
         match self {
-            Self::NoSubscription
-            | Self::NoUsableServers
-            | Self::UnknownServer { .. }
-            | Self::CoreStartFailed { .. } => false,
+            Self::NoSubscription | Self::NoUsableServers | Self::UnknownServer { .. } => false,
+            Self::CoreStartFailed { permanent, .. } => !permanent,
             Self::SubscriptionUnavailable { .. }
             | Self::HandshakeTimeout { .. }
             | Self::NetworkSetupFailed { .. }
@@ -100,10 +125,13 @@ impl TunnelError {
 
     /// Требуется ли действие пользователя.
     pub fn needs_user_action(&self) -> bool {
-        matches!(
-            self,
-            Self::NoSubscription | Self::NoUsableServers | Self::CoreStartFailed { .. }
-        )
+        match self {
+            Self::NoSubscription | Self::NoUsableServers => true,
+            // Просить пользователя что-то сделать из-за отказа, который демон
+            // сам же исправит следующей попыткой, — это ложная тревога.
+            Self::CoreStartFailed { permanent, .. } => *permanent,
+            _ => false,
+        }
     }
 }
 
@@ -116,7 +144,7 @@ impl fmt::Display for TunnelError {
             }
             Self::NoUsableServers => f.write_str("в подписке нет поддерживаемых серверов"),
             Self::UnknownServer { id } => write!(f, "сервер {id} отсутствует в списке"),
-            Self::CoreStartFailed { detail } => write!(f, "ядро не запустилось: {detail}"),
+            Self::CoreStartFailed { detail, .. } => write!(f, "ядро не запустилось: {detail}"),
             Self::HandshakeTimeout { seconds } => {
                 write!(f, "туннель не поднялся за {seconds} с")
             }

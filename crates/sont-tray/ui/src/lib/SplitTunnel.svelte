@@ -123,7 +123,7 @@
           <!-- У сайта имя и адрес совпадают — второй строкой её не дублируем. -->
           {#if entry.detail !== entry.title}<span class="path">{entry.detail}</span>{/if}
         </span>
-        <button class="drop" onclick={() => drop(entry)}>{$t("btn.remove")}</button>
+        <button class="drop outlined" onclick={() => drop(entry)}>{$t("btn.remove")}</button>
       </div>
     {/each}
   </div>
@@ -158,7 +158,7 @@
     font-size: 10px;
     font-weight: 500;
     line-height: 125%;
-    color: var(--cream);
+    color: var(--fg);
   }
 
   .empty {
@@ -197,7 +197,7 @@
     font-size: 9px;
     font-weight: 500;
     line-height: 125%;
-    color: var(--cream);
+    color: var(--fg);
   }
 
   /* Путь целиком не влезает, и обрезать его надо с начала: различаются такие
@@ -211,7 +211,7 @@
     font-size: 7px;
     font-weight: 350;
     line-height: 125%;
-    color: rgba(244, 237, 229, 0.45);
+    color: rgba(var(--fg-rgb), 0.45);
   }
 
   .drop {
@@ -220,7 +220,7 @@
     border: 0;
     border-radius: 3px;
     background: transparent;
-    box-shadow: inset 0 0 0 0.5px rgba(244, 237, 229, 0.4);
+    box-shadow: inset 0 0 0 0.5px rgba(var(--fg-rgb), 0.4);
     color: var(--dim-1);
     font-family: inherit;
     font-size: 8px;

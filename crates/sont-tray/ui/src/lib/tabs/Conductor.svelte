@@ -45,7 +45,12 @@
     { value: "lockdown", label: $t("fw.lockdown") },
   ]);
 
-  const apps = $derived($settings?.split_tunnel?.apps?.length ?? 0);
+  // Считаем и программы, и сайты: строка — вход на страницу, и число в ней
+  // должно совпадать с тем, что там лежит. Пока считались одни программы,
+  // список из трёх сайтов показывался как «0».
+  const listed = $derived(
+    ($settings?.split_tunnel?.apps?.length ?? 0) + ($settings?.split_tunnel?.sites?.length ?? 0),
+  );
 </script>
 
 {#if page === "split"}
@@ -105,7 +110,7 @@
   </Row>
 
   <BoxedRow label={$t("split.title")} clickable onclick={() => (page = "split")}>
-    <span class="aside">{apps} {$t("msg.apps")} ›</span>
+    <span class="aside">{listed} {$t("split.count")} ›</span>
   </BoxedRow>
 
   <Section title={$t("sec.ondrop")} rule />
@@ -130,11 +135,13 @@
 {/if}
 
 <style>
+  /* Приписка нажимаемой строки — той же яркости, что и её подпись: гасить
+     половину строки, которую предлагают нажать, незачем. */
   .aside {
     font-size: 9px;
     font-weight: 400;
     line-height: 130%;
     white-space: nowrap;
-    color: var(--dim-4);
+    color: var(--dim-2);
   }
 </style>

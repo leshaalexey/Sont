@@ -42,7 +42,7 @@
     font-size: 10px;
     font-weight: 400;
     line-height: 125%;
-    color: var(--cream);
+    color: var(--fg);
   }
 
   /*

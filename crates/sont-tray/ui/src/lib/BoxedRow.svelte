@@ -9,7 +9,7 @@
 </script>
 
 {#if clickable}
-  <button class="boxed as-button" class:dashed {onclick}>
+  <button class="boxed as-button outlined" class:dashed {onclick}>
     {#if label}<span class="label">{label}</span>{/if}
     {@render children?.()}
   </button>
@@ -61,9 +61,25 @@
     padding-right: 7px;
   }
 
+  /*
+   * Нажимаемая строка светлее неподвижных.
+   *
+   * Раньше она выглядела ровно как соседние — «насколько быстрее» и «попыток
+   * до смены сервера», — но те менялись на месте, а эта уводит на отдельную
+   * страницу. Одинаковый вид у строки, которую нажимают, и у строки, которую
+   * не нажимают, — это предложение выяснять разницу опытным путём.
+   *
+   * Ярче и рамка, и подпись, и стрелка справа: по отдельности каждый признак
+   * слаб, вместе читаются сразу.
+   */
   .as-button {
     cursor: pointer;
     padding-right: 11px;
+    border-color: rgba(var(--fg-rgb), 0.45);
+  }
+
+  .as-button .label {
+    color: var(--fg);
   }
 
   .label {

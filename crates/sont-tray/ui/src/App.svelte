@@ -9,7 +9,7 @@
   import Conductor from "./lib/tabs/Conductor.svelte";
   import Keys from "./lib/tabs/Keys.svelte";
   import System from "./lib/tabs/System.svelte";
-  import { settings, start } from "./lib/daemon.js";
+  import { settings, start, resyncTheme } from "./lib/daemon.js";
 
   let tab = $state("conductor");
   let scroll = $state(null);
@@ -128,9 +128,17 @@
       clearTimeout(hiding);
       hiding = setTimeout(() => appWindow?.hide(), SLIDE_MS + 120);
     });
+    // Оформление системы сменилось: тема панели задач живёт в реестре, и её
+    // правка не поднимает `prefers-color-scheme` — про неё сообщает трей.
+    listen("sont://theme", resyncTheme);
+
     listen("sont://show", () => {
       clearTimeout(hiding);
       shown = true;
+      // Тема панели задач могла смениться, пока окно было спрятано, а узнать
+      // об этом неоткуда: её смена не поднимает `prefers-color-scheme`.
+      // Показ окна — единственный момент, когда спросить и уместно, и нужно.
+      resyncTheme();
     });
   }
 
@@ -273,11 +281,11 @@
     border-radius: inherit;
     /*
      * Цвет непрозрачный. Полупрозрачная линия смешивалась с тем, что под
-     * ней, а под ней в верхней полосе шапка (18, 18, 17), а ниже — тело
-     * (33, 33, 33): одна и та же обводка выходила двух разных оттенков.
-     * Теперь она одинакова по всему периметру.
+     * ней, а под ней в верхней полосе шапка, а ниже — тело: одна и та же
+     * обводка выходила двух разных оттенков. Теперь она одинакова по всему
+     * периметру, и своя в каждой теме — см. `--window-edge`.
      */
-    box-shadow: inset 0 0 0 calc(1px / var(--ui-scale)) rgb(68, 66, 64);
+    box-shadow: inset 0 0 0 calc(1px / var(--ui-scale)) var(--window-edge);
     pointer-events: none;
   }
 
@@ -350,7 +358,7 @@
    * момент, когда это уже и так видно по движению.
    */
   .scrolling::-webkit-scrollbar-thumb {
-    background: rgba(244, 237, 229, 0.18);
+    background: rgba(var(--fg-rgb), 0.18);
     background-clip: padding-box;
   }
 

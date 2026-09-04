@@ -66,7 +66,7 @@
     padding: 0;
     border: 0;
     background: transparent;
-    color: var(--cream);
+    color: var(--fg);
     font-family: inherit;
     font-size: 10px;
     font-weight: 350;
@@ -77,6 +77,6 @@
   }
 
   .field::placeholder {
-    color: rgba(244, 237, 229, 0.45);
+    color: rgba(var(--fg-rgb), 0.45);
   }
 </style>

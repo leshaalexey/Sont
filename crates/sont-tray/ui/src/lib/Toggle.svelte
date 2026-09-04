@@ -36,7 +36,6 @@
     border: 0;
     border-radius: 9px;
     background: transparent;
-    box-shadow: inset 0 0 0 0.4px var(--accent);
     overflow: hidden;
     cursor: pointer;
   }
@@ -48,7 +47,7 @@
     width: 25px;
     height: 13px;
     border-radius: 8px;
-    background: rgba(244, 237, 229, 0.1);
+    background: rgba(var(--fg-rgb), 0.1);
     transition: background 180ms var(--ease);
   }
 
@@ -68,7 +67,7 @@
     width: 9px;
     height: 9px;
     border-radius: 6px;
-    background: rgba(244, 237, 229, 0.55);
+    background: rgba(var(--fg-rgb), 0.55);
     transition: transform 180ms var(--ease), background 180ms var(--ease);
   }
 

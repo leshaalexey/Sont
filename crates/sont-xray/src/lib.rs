@@ -23,5 +23,5 @@ pub mod config;
 pub mod metrics;
 pub mod support;
 
-pub use config::{build, BuildError, RuntimeInfo};
+pub use config::{build, build_race, BuildError, RuntimeInfo};
 pub use support::{supports, unsupported_reason};

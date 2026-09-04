@@ -12,6 +12,7 @@ mod firewall;
 mod logging;
 mod paths;
 mod probe;
+mod race;
 mod secrets;
 #[cfg(windows)]
 mod service;

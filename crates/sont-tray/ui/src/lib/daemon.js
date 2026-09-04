@@ -64,6 +64,7 @@ const PREVIEW = {
     preferred_transports: [],
     language: "ru",
     system_accent: false,
+    theme: "system",
     dns: { mode: "tunnel", block_plain_dns: true, fake_ip: false },
     split_tunnel: { mode: "off", apps: [], sites: [] },
   },
@@ -113,15 +114,27 @@ export async function applyAccent(enabled) {
   // же синий» хуже, чем не менять ничего: пользователь включил настройку и
   // увидел бы цвет, которого в системе нет.
   if (!hex) {
-    root.style.removeProperty("--accent");
-    root.style.removeProperty("--on-accent");
-    root.style.removeProperty("--on-accent-weight");
+    for (const name of ACCENTED) root.style.removeProperty(name);
     return;
   }
 
   const on = readableOn(hex);
   root.style.setProperty("--accent", hex);
   root.style.setProperty("--on-accent", on);
+
+  /*
+   * Плашки и маскот красятся заодно — иначе настройка перестала бы делать то,
+   * что обещает подписью под ней.
+   *
+   * В тёмной теме они и так повторяют акцент, а вот в светлой по умолчанию
+   * расходятся с ним: там плашка остаётся белой, чтобы не спорить с полосой
+   * под собой. Включённый цвет системы возвращает их к акценту.
+   */
+  root.style.setProperty("--raised", hex);
+  root.style.setProperty("--on-raised", on);
+  root.style.setProperty("--mascot", hex);
+  // Закрашенной плашке край не нужен: её и так видно.
+  root.style.setProperty("--raised-edge", "transparent");
 
   /*
    * Светлая надпись на тёмной заливке кажется жирнее тёмной на светлой при
@@ -132,6 +145,80 @@ export async function applyAccent(enabled) {
    */
   const light = on !== DARK_TEXT;
   root.style.setProperty("--on-accent-weight", light ? "-50" : "0");
+  root.style.setProperty("--on-raised-weight", light ? "-50" : "0");
+}
+
+/**
+ * Всё, что подменяет цвет системы.
+ *
+ * Списком, а не перечислением по месту: снимать надо ровно то, что ставилось,
+ * и разъедься эти два набора — выключенная настройка оставила бы половину окна
+ * покрашенной, причём в теме, которую забыли открыть.
+ */
+const ACCENTED = [
+  "--accent",
+  "--on-accent",
+  "--on-accent-weight",
+  "--raised",
+  "--on-raised",
+  "--on-raised-weight",
+  "--mascot",
+  "--raised-edge",
+];
+
+/**
+ * Ставит тему окна: светлую, тёмную или ту, что выбрана в системе.
+ *
+ * «Как в системе» разрешается здесь, а не в CSS, и берётся из параметров
+ * Windows, а не у движка.
+ *
+ * Причина в том, что это разные настройки. Медиазапрос `prefers-color-scheme`
+ * отвечает по теме окон приложений, а окно Sont стоит в ряду с панелью задач и
+ * равняется на неё — у Windows это отдельное значение, и «тёмная система со
+ * светлыми окнами» ставится в ней одним щелчком. Спрашиваем реестр, к
+ * медиазапросу обращаемся только там, где спросить некого: в браузере
+ * предпросмотра и на системах без такого понятия.
+ */
+export async function applyTheme(theme) {
+  const resolved =
+    theme === "light" || theme === "dark" ? theme : (await call("system_theme")) ?? preferred();
+
+  document.documentElement.dataset.theme = resolved;
+}
+
+/** Что считает светлой темой сам движок. Запасной ответ, когда системы нет. */
+function preferred() {
+  return window.matchMedia?.("(prefers-color-scheme: light)").matches ? "light" : "dark";
+}
+
+/**
+ * Перечитывает тему у системы и применяет заново.
+ *
+ * Вызывается при показе окна — и это единственный надёжный момент. Тема панели
+ * задач живёт в реестре, и её смена не поднимает `prefers-color-scheme`:
+ * медиазапрос следит за темой окон приложений, то есть за соседним значением.
+ * Опрашивать реестр постоянно незачем — окно трея живёт секунды, и спросить
+ * достаточно тогда, когда его открывают.
+ */
+export async function resyncTheme() {
+  let chosen;
+  settings.subscribe((s) => (chosen = s?.theme))();
+  // Явный выбор пользователя перечитывать не надо: он не в системе, а в
+  // настройках демона, и сам собой не меняется.
+  if (!chosen || chosen === "system") await applyTheme("system");
+}
+
+/**
+ * Следит за сменой темы системы, пока окно открыто.
+ *
+ * Ловит случай, когда пользователь меняет оформление, не закрывая окно.
+ * Медиазапрос здесь — не источник значения, а только сигнал «пора спросить
+ * заново»: сработает он лишь на смене темы приложений, но её обычно переключают
+ * вместе с темой Windows.
+ */
+function watchSystemTheme() {
+  const media = window.matchMedia?.("(prefers-color-scheme: light)");
+  media?.addEventListener?.("change", resyncTheme);
 }
 
 let previewPick = false;
@@ -159,6 +246,9 @@ async function call(command, args) {
     // В браузере системного цвета нет — берём узнаваемый синий Windows,
     // чтобы настройку было на чём проверить.
     if (command === "system_accent") return "#0078D4";
+    // Своей системы у браузера предпросмотра нет: пусть тема решается
+    // медиазапросом, как она решается на системах без такого понятия.
+    if (command === "system_theme") return null;
     // В предпросмотре чередуем: первый выбор — сайт, второй — программа.
     if (command === "pick_app_by_click") {
       previewPick = !previewPick;
@@ -186,6 +276,7 @@ export async function refresh() {
     settings.set(cfg);
     info.set(i);
     await applyAccent(cfg?.system_accent);
+    await applyTheme(cfg?.theme);
   } catch (e) {
     status.set(null);
     say(String(e), true);
@@ -198,6 +289,7 @@ export async function patch(fields) {
     const updated = await call("patch", { patch: fields });
     settings.set(updated);
     await applyAccent(updated?.system_accent);
+    await applyTheme(updated?.theme);
   } catch (e) {
     say(String(e), true);
   }
@@ -219,6 +311,7 @@ export const ask = call;
 
 /** Подписывается на события демона и делает первое чтение. */
 export async function start() {
+  watchSystemTheme();
   await refresh();
   if (listen) await listen("sont://event", refresh);
 }

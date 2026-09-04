@@ -1141,6 +1141,165 @@ mod accent {
     }
 }
 
+/// Тема панели задач: `"light"`, `"dark"` или `None`.
+///
+/// Именно панели задач, а не окон приложений, — окно Sont стоит в ряду с ней.
+/// Подробности выбора значения см. в [`theme`].
+///
+/// `None` — узнать не удалось. Окно тогда решает само по `prefers-color-scheme`
+/// движка: ошибиться в пользу его догадки лучше, чем выбрать наугад.
+#[tauri::command]
+async fn system_theme() -> Option<&'static str> {
+    theme::current()
+}
+
+/// Чтение светлой/тёмной темы системы.
+///
+/// Спрашиваем реестр, а не `prefers-color-scheme`: пользователь просил именно
+/// цвет системы, а движок отвечает по теме, назначенной окну, и в зависимости
+/// от версии WebView2 и настроек Tauri может не узнать о смене вовсе.
+#[cfg(windows)]
+mod theme {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegGetValueW, RegNotifyChangeKeyValue, RegOpenKeyExW, HKEY,
+        HKEY_CURRENT_USER, KEY_NOTIFY, REG_NOTIFY_CHANGE_LAST_SET, RRF_RT_REG_DWORD,
+    };
+
+    /// Ветка, куда Windows кладёт выбор пользователя.
+    const PATH: &str = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize";
+
+    /// Тема панели задач и меню «Пуск» — то, что в параметрах Windows названо
+    /// «режим Windows».
+    ///
+    /// Именно она, а не `AppsUseLightTheme`. Это два разных значения, и
+    /// пользователь часто ставит их по-разному: тёмная система со светлыми
+    /// окнами — обычная настройка по умолчанию в Windows 11.
+    ///
+    /// Окно Sont — не окно приложения, а всплывающая панель, встающая в ряд с
+    /// часами, звуком и сетью. Соседи у неё — панель задач и её всплывашки, и
+    /// равняться она обязана на них: светлая панель рядом с тёмной панелью
+    /// задач выглядит чужой независимо от того, какие у пользователя окна.
+    const SYSTEM: &str = "SystemUsesLightTheme";
+
+    /// Запасное значение — тема окон приложений.
+    ///
+    /// Нужно на случай, когда `SystemUsesLightTheme` в профиле нет: значение
+    /// появилось не во всех сборках Windows 10, а в свежем профиле обоих может
+    /// не быть до первого захода в параметры оформления. Ответить «не знаю»
+    /// там, где одно из двух значений всё-таки есть, — хуже, чем ответить по
+    /// соседнему.
+    const APPS: &str = "AppsUseLightTheme";
+
+    pub fn current() -> Option<&'static str> {
+        let light = read(SYSTEM).or_else(|| read(APPS))?;
+        Some(if light { "light" } else { "dark" })
+    }
+
+    /// Зовёт `on_change` каждый раз, когда пользователь меняет оформление.
+    ///
+    /// # Почему не опрос
+    ///
+    /// Windows умеет разбудить поток сама, и просыпаться по таймеру ради
+    /// настройки, которую трогают раз в месяц, незачем. Ожидание блокирующее и
+    /// живёт в своём потоке: асинхронная форма потребовала бы событие и цикл
+    /// сообщений, а выигрыш нулевой — поток всё равно только ждёт.
+    ///
+    /// # Почему подписка вообще нужна
+    ///
+    /// Значок в трее висит постоянно, в том числе при спрятанном окне. Без
+    /// подписки он перекрашивался бы только на смене состояния соединения —
+    /// то есть пользователь, переключивший тему Windows, до ближайшего
+    /// переподключения смотрел бы на белый значок на белой панели.
+    pub fn watch(mut on_change: impl FnMut() + Send + 'static) {
+        std::thread::spawn(move || {
+            // Уведомление одноразовое: на каждый круг подписываемся заново.
+            while wait_for_change() {
+                on_change();
+            }
+            // Ветку не открыть или ожидание отказало. Крутиться дальше значит
+            // жечь ядро вхолостую — уходим, значок останется на цвете, который
+            // выбран при запуске.
+            tracing::debug!("слежение за темой системы прекращено");
+        });
+    }
+
+    /// Блокируется до ближайшего изменения ветки. `false` — ждать не вышло.
+    fn wait_for_change() -> bool {
+        let path = wide(PATH);
+        let mut key: HKEY = std::ptr::null_mut();
+
+        // SAFETY: путь завершён нулём, выход указывает на стек.
+        let opened = unsafe {
+            RegOpenKeyExW(
+                HKEY_CURRENT_USER,
+                path.as_ptr(),
+                0,
+                KEY_NOTIFY,
+                &mut key,
+            )
+        };
+        if opened != 0 {
+            return false;
+        }
+
+        // SAFETY: ключ открыт с правом на уведомления; событие не передаём,
+        // потому что ждём синхронно — на это указывает последний аргумент.
+        let code = unsafe {
+            RegNotifyChangeKeyValue(
+                key,
+                0,
+                REG_NOTIFY_CHANGE_LAST_SET,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+
+        // SAFETY: дескриптор получен от RegOpenKeyExW и больше не нужен.
+        unsafe { RegCloseKey(key) };
+        code == 0
+    }
+
+    /// Читает одно значение ветки. `None` — значения нет.
+    fn read(name: &str) -> Option<bool> {
+        let path = wide(PATH);
+        let name = wide(name);
+        let mut value: u32 = 0;
+        let mut size = std::mem::size_of::<u32>() as u32;
+
+        // SAFETY: строки завершены нулём, буфер и его размер согласованы.
+        let code = unsafe {
+            RegGetValueW(
+                HKEY_CURRENT_USER,
+                path.as_ptr(),
+                name.as_ptr(),
+                RRF_RT_REG_DWORD,
+                std::ptr::null_mut(),
+                (&mut value as *mut u32).cast(),
+                &mut size,
+            )
+        };
+        if code != 0 {
+            return None;
+        }
+
+        Some(value != 0)
+    }
+
+    fn wide(value: &str) -> Vec<u16> {
+        value.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+}
+
+#[cfg(not(windows))]
+mod theme {
+    pub fn current() -> Option<&'static str> {
+        None
+    }
+
+    /// Оформления, за которым можно следить, тут нет — подписка пустая.
+    pub fn watch(_on_change: impl FnMut() + Send + 'static) {}
+}
+
 #[tauri::command]
 async fn daemon_info(app: AppHandle, link: State<'_, Link>) -> Result<Value, String> {
     match expect_ok(ask(&app, &link, Request::DaemonInfo).await?)? {
@@ -1326,7 +1485,7 @@ impl TrayArt {
     /// 32×32 занимали бы разную долю площади, и вторая иконка выглядела бы
     /// заметно мельче первой. Обнимающий холст даёт обеим одинаковый вес
     /// рядом с чужими значками в трее.
-    fn image(&self) -> tauri::image::Image<'static> {
+    fn image(&self, ink: [u8; 4]) -> tauri::image::Image<'static> {
         let long = self.width.max(self.height).max(1);
         // Целый множитель — обязательное условие чёткости: дробное
         // растяжение пиксельной графики и есть то самое мыло.
@@ -1350,7 +1509,7 @@ impl TrayArt {
                             continue;
                         }
                         let o = ((py * size + px) * 4) as usize;
-                        rgba[o..o + 4].copy_from_slice(&[244, 237, 229, 255]);
+                        rgba[o..o + 4].copy_from_slice(&ink);
                     }
                 }
             }
@@ -1366,6 +1525,26 @@ impl TrayArt {
 /// уменьшать она умеет без потерь, в отличие от увеличения. Точное значение
 /// получается округлением вниз до целого множителя.
 const TRAY_TARGET: u32 = 32;
+
+/// Цвет рисунка в трее.
+///
+/// Иконка одноцветная и лежит не на своём фоне, а прямо на панели задач.
+/// Кремовый маскот на светлой панели пропадает так же начисто, как тёмный на
+/// тёмной, — поэтому цвет выбирается по теме панели задач, по той же настройке
+/// системы, на которую равняется и окно.
+///
+/// Неизвестность трактуется в пользу тёмной панели: у Windows это положение по
+/// умолчанию, и ошибка в его сторону оставляет иконку видимой у большинства.
+fn tray_ink() -> [u8; 4] {
+    const CREAM: [u8; 4] = [244, 237, 229, 255];
+    const INK: [u8; 4] = [33, 33, 33, 255];
+
+    if matches!(theme::current(), Some("light")) {
+        INK
+    } else {
+        CREAM
+    }
+}
 
 /// Спрашивает состояние у демона и приводит иконку в соответствие.
 ///
@@ -1395,7 +1574,7 @@ fn update_tray(app: &AppHandle, state: &str) {
     // поднято, трафик через него не идёт, и обещать обратное иконкой нельзя.
     let art = if state == "connected" { &IDLE } else { &OFFLINE };
 
-    let _ = tray.set_icon(Some(art.image()));
+    let _ = tray.set_icon(Some(art.image(tray_ink())));
     let _ = tray.set_tooltip(Some(format!("Sont — {state}")));
 
     // Пока идёт подключение или отключение, пункт называется по тому, чем
@@ -1657,6 +1836,7 @@ fn main() {
             patch,
             daemon_info,
             system_accent,
+            system_theme,
             pick_app_by_click,
             connect,
             disconnect,
@@ -1688,7 +1868,7 @@ fn main() {
             app.manage(ToggleItem(toggle.clone()));
 
             TrayIconBuilder::with_id("sont")
-                .icon(OFFLINE.image())
+                .icon(OFFLINE.image(tray_ink()))
                 .tooltip("Sont")
                 .menu(&menu)
                 .show_menu_on_left_click(false)
@@ -1728,6 +1908,21 @@ fn main() {
             // Агент живёт ровно столько, сколько открыт трей: он и есть то
             // «что-то в сеансе пользователя», ради чего агент существует.
             app.manage(Agent(std::sync::Mutex::new(spawn_agent())));
+
+            // Смена оформления системы перекрашивает и значок, и окно.
+            //
+            // Значок — потому что он лежит прямо на панели задач и обязан быть
+            // виден на её новом цвете. Окно — потому что тема панели задач не
+            // поднимает `prefers-color-scheme`: там своё значение, и открытое
+            // окно иначе осталось бы в прежней теме до следующего показа.
+            let painter = handle.clone();
+            theme::watch(move || {
+                let painter = painter.clone();
+                tauri::async_runtime::spawn(async move {
+                    refresh_tray(&painter).await;
+                    let _ = painter.emit("sont://theme", ());
+                });
+            });
 
             // Связь с демоном поднимаем сразу, не дожидаясь, пока пользователь
             // откроет окно.

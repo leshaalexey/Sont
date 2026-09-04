@@ -29,7 +29,18 @@ use crate::{demo, secrets, store};
 ///
 /// Меньше, чем ждёт CLI: пользователь должен получить причину от демона, а не
 /// собственный таймаут клиента, из которого ничего не понятно.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+///
+/// # Почему пятнадцать, а не тридцать
+///
+/// Это предохранитель, а не рабочий срок: он обязан быть длиннее суммы этапов
+/// ([`READY_TIMEOUT`] плюс [`ROUTING_TIMEOUT`] плюс запуск ядра), иначе
+/// сработает раньше них и подменит точную причину отказа общим «не успело».
+/// Сроки этапов сокращены вдвое, и вместе с ними сократился он.
+///
+/// Дожидаться этого срока пользователю теперь почти не приходится: сервер, до
+/// которого нет пути, отсеивается проверкой перед запуском ядра (см.
+/// [`choose_working`]), а не тратой всей последовательности подключения.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Период публикации статистики и проверки живости ядра.
 const STATS_INTERVAL: Duration = Duration::from_secs(1);
@@ -39,7 +50,12 @@ const STATS_INTERVAL: Duration = Duration::from_secs(1);
 /// Ядро может остаться живым процессом, а соединение с сервером при этом
 /// оборваться — упавший процесс мы замечаем сразу, а вот молчащий туннель
 /// виден только по проверке.
-const HEALTH_INTERVAL: Duration = Duration::from_secs(30);
+///
+/// Пятнадцать секунд, а не тридцать: обрыв подтверждается только второй
+/// неудачной проверкой подряд, то есть с прежним интервалом пользователь сидел
+/// без сети до минуты, ничего об этом не зная. Один запрос через уже поднятый
+/// локальный SOCKS раз в четверть минуты не стоит ничего.
+const HEALTH_INTERVAL: Duration = Duration::from_secs(15);
 
 /// Сколько неудачных проверок подряд считаем обрывом.
 ///
@@ -49,13 +65,20 @@ const HEALTH_FAILURES_BEFORE_RECONNECT: u32 = 2;
 
 /// Как часто демон возвращается к соединению, которого добивается, но не имеет.
 ///
-/// Пятнадцать секунд: достаточно редко, чтобы не долбиться в заведомо
+/// Пять секунд: достаточно редко, чтобы не долбиться в заведомо
 /// неподнимающийся туннель, и достаточно часто, чтобы пользователь, добавивший
-/// ключ или починивший сеть, не успел заметить паузу.
-const RECONCILE_INTERVAL: Duration = Duration::from_secs(15);
+/// ключ или починивший сеть, не успел заметить паузу. Прежние пятнадцать были
+/// расчётом на то, что каждая попытка стоит полминуты; с проверкой кандидатов
+/// перед запуском неудачная попытка стала дешёвой, и ждать столько незачем.
+const RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 
 /// Потолок паузы между попытками переподключения.
-const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(60);
+///
+/// Пятнадцать секунд. Пауза приходится на состояние «восстанавливаю», а
+/// примиритель в него не вмешивается — считает, что попытка уже идёт. Значит,
+/// потолок это и есть время, которое пользователь просидит без сети после того,
+/// как сеть у него уже появилась.
+const RECONNECT_MAX_DELAY: Duration = Duration::from_secs(15);
 
 /// Как часто перемеряем задержку до серверов в фоне.
 ///
@@ -73,14 +96,65 @@ const PROBE_INTERVAL: Duration = Duration::from_secs(300);
 /// упавшему VLESS-серверу устанавливается прекрасно, отказывает уже туннель.
 const FAILED_SERVER_COOLDOWN: Duration = Duration::from_secs(600);
 
+/// С чего начинается удвоение пауз.
+///
+/// Четверть секунды, а не целая. Первая пауза — это то, что видит человек,
+/// глядя на «восстанавливаю»: короткий обрыв должен закрыться незаметно, а
+/// секунда простоя уже читается как «зависло». Удвоение всё равно быстро
+/// уводит паузу вверх, если недоступность оказалась настоящей.
+const RECONNECT_BASE_DELAY: Duration = Duration::from_millis(250);
+
 /// Пауза перед попыткой номер `attempt`.
 ///
-/// Удвоение с потолком: первые попытки идут быстро, чтобы короткий обрыв
-/// закрылся незаметно, а долгая недоступность не превращалась в непрерывный
-/// поток запросов к серверу и расход батареи.
+/// # Почему первая попытка идёт без паузы
+///
+/// Восстановление обязано начинаться так же быстро, как подключение по кнопке.
+/// Пользователю разницы между ними нет: и там, и там он смотрит на окно и ждёт
+/// сети. Пауза перед первой же попыткой делала восстановление заведомо
+/// медленнее — на ровном месте, потому что обрыв и повтор разделяет ещё и
+/// проверка кандидатов, которая сама по себе занимает время.
+///
+/// Дальше — удвоение с потолком: если не вышло и со второго раза, дело не в
+/// случайности, и непрерывный поток запросов к серверу её не исправит.
 fn reconnect_delay(attempt: u32) -> Duration {
-    let seconds = 1u64.checked_shl(attempt.saturating_sub(1)).unwrap_or(u64::MAX);
-    Duration::from_secs(seconds).min(RECONNECT_MAX_DELAY)
+    if attempt <= 1 {
+        return Duration::ZERO;
+    }
+    let factor = 1u32.checked_shl(attempt - 2).unwrap_or(u32::MAX);
+    RECONNECT_BASE_DELAY
+        .saturating_mul(factor)
+        .min(RECONNECT_MAX_DELAY)
+}
+
+/// Пауза перед конкретной попыткой восстановления.
+///
+/// Пауза выдерживается перед возвратом на тот же сервер — и только. Она
+/// заведена, чтобы не долбиться в сервер, который секунду назад отказал.
+/// К другому серверу это не относится вовсе: он ничем не провинился, а ждать
+/// перед ним значит держать пользователя без сети ровно столько, сколько
+/// накопил счётчик неудач предыдущего. Именно так и получалось, что смена
+/// сервера при плохой связи наступала через полминуты после обрыва.
+fn reconnect_delay_for(attempt: u32, same_server: bool) -> Duration {
+    if same_server {
+        reconnect_delay(attempt)
+    } else {
+        Duration::ZERO
+    }
+}
+
+/// Вправе ли гонка поправить выбор сервера перед запуском.
+///
+/// Разница не в том, хочется ли проверить сервер, а в том, есть ли у демона
+/// право его сменить. Смена настроек и переход на найденный более быстрый
+/// сервер — это решения, уже принятые по своим основаниям: гонка там не
+/// проверяла бы выбор, а отменяла бы его, попутно возвращая пользователя на тот
+/// самый сервер, с которого его только что решили увести.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Selection {
+    /// Сервер назван ранжированием — гонка вправе назвать другой.
+    Race,
+    /// Сервер выбран по отдельному основанию и подмене не подлежит.
+    Fixed,
 }
 
 /// Чего добивается демон, независимо от того, что происходит сейчас.
@@ -119,6 +193,11 @@ pub struct SupervisorConfig {
 /// Без `Debug`: внутри переносится дескриптор процесса ядра, который печатать
 /// незачем.
 pub enum Internal {
+    /// Проверка перед запуском увела попытку на другой сервер.
+    ///
+    /// Отдельным сообщением, а не полем в `CoreStarted`: состояние обязано
+    /// показать новый сервер сразу, а не через весь срок подключения к нему.
+    ServerChosen { generation: u64, server: ProfileId },
     /// Ядро и сетевой слой подняты, связность подтверждена.
     CoreStarted {
         generation: u64,
@@ -838,7 +917,7 @@ impl Supervisor {
         });
 
         let previous = self.active.take();
-        if let Err(e) = self.launch(target, previous, Duration::ZERO) {
+        if let Err(e) = self.launch(target, previous, Duration::ZERO, Selection::Fixed) {
             tracing::error!(error = %e, "не удалось перейти на другой сервер");
             self.fail(e);
         }
@@ -1080,7 +1159,7 @@ impl Supervisor {
         // TUN-адаптер, за которым больше никто не следит и который нечем
         // будет отключить.
         let previous = self.active.take();
-        self.launch(id, previous, Duration::ZERO)
+        self.launch(id, previous, Duration::ZERO, Selection::Race)
     }
 
     // ─────────────────────────── kill-switch ───────────────────────────
@@ -1180,11 +1259,16 @@ impl Supervisor {
     /// Общий путь для первого подключения и для восстановления: разойдись они,
     /// и восстановление рано или поздно начнёт отличаться от подключения в
     /// мелочах, которые всплывут только у пользователя.
+    ///
+    /// При `Selection::Race` названный сервер — предпочтение, а не приговор: он
+    /// вместе с лучшими из остальных участвует в гонке, и подключение уходит к
+    /// тому, кто первым проведёт настоящий запрос. См. [`choose_working`].
     fn launch(
         &mut self,
         id: ProfileId,
         previous: Option<Started>,
         delay: Duration,
+        selection: Selection,
     ) -> Result<(), TunnelError> {
         let profile = self
             .servers
@@ -1197,10 +1281,19 @@ impl Supervisor {
         // секунду сообщить, что протокол вообще не поддерживается, — худший
         // из возможных вариантов.
         if let Some(reason) = sont_xray::unsupported_reason(&profile.transport) {
+            // Навсегда: этот профиль ядру не по зубам, и следующая попытка
+            // упрётся в то же самое. Автовыбор до сюда не доходит — такие
+            // серверы отсеиваются ещё в `candidates`.
             return Err(TunnelError::CoreStartFailed {
                 detail: reason.to_owned(),
+                permanent: true,
             });
         }
+
+        let race_pool = match selection {
+            Selection::Race => self.race_pool(&profile),
+            Selection::Fixed => Vec::new(),
+        };
 
         self.generation += 1;
         let generation = self.generation;
@@ -1229,6 +1322,10 @@ impl Supervisor {
         let launcher = Arc::clone(&self.launcher);
         let settings = self.settings.clone();
         let config_path = self.config.core_config_path.clone();
+        // Конфигурация гонки живёт отдельным файлом рядом с основной: она
+        // содержит учётные данные всех проверяемых серверов, и класть её на
+        // место рабочей значит терять рабочую при каждой проверке.
+        let race_config = config_path.with_extension("race.json");
 
         tokio::spawn(async move {
             // Прежний сеанс гасим до паузы, а не после: он держит маршруты и
@@ -1238,6 +1335,32 @@ impl Supervisor {
             }
             if !delay.is_zero() {
                 tokio::time::sleep(delay).await;
+            }
+
+            // Кого поднимать, решается в последний момент и по настоящей
+            // проверке.
+            //
+            // Ранжирование по замерам отвечает на вопрос «какой сервер ближе»,
+            // но не на вопрос «работает ли он»: до сервера с истёкшим ключом
+            // TCP доходит прекрасно, и рукопожатие Reality он проводит честно.
+            // Раньше это выяснялось запуском ядра на каждом кандидате по
+            // очереди — то есть ценой полной последовательности подключения за
+            // каждый негодный сервер. Здесь все кандидаты проверяются разом.
+            let profile = match choose_working(&launcher, race_pool, &settings, &race_config).await
+            {
+                Some(winner) => winner,
+                // Проверка ничего не показала — ни про один сервер. Идём туда,
+                // куда указало ранжирование: другого основания у нас нет.
+                None => profile,
+            };
+
+            if profile.id != id {
+                let _ = tx
+                    .send(Internal::ServerChosen {
+                        generation,
+                        server: profile.id.clone(),
+                    })
+                    .await;
             }
 
             // Порты выбираем только теперь.
@@ -1283,6 +1406,95 @@ impl Supervisor {
         });
 
         Ok(())
+    }
+
+    /// Кандидаты, между которыми разыгрывается право на подключение.
+    ///
+    /// Первым идёт выбранный ранжированием сервер, дальше — лучшие из
+    /// оставшихся. Порядок здесь не решающий (побеждает тот, кто первым
+    /// проведёт запрос), но он определяет, кто вообще попадёт в гонку.
+    ///
+    /// Пусто, когда сервер выбран не демоном: закреплённый пользователем сервер
+    /// подменять нельзя даже молчащим. Пользователь просил именно его и должен
+    /// увидеть именно его отказ, а не молча оказаться в другой стране.
+    ///
+    /// Из пула исключаются недавно упавшие: гонка живёт одной секундой, а
+    /// штрафной ящик помнит то, чего она узнать не может, — что туннель через
+    /// этот сервер уже разваливался под нагрузкой.
+    ///
+    /// И серверы, которых не умеет ядро: они не могут стать дорожкой, а один
+    /// такой в списке отменил бы сборку всей конфигурации проверки.
+    fn race_pool(&self, primary: &ServerProfile) -> Vec<ServerProfile> {
+        if !self.picks_the_server_itself() || !sont_xray::supports(&primary.transport) {
+            return Vec::new();
+        }
+
+        let mut ranked: Vec<&ServerProfile> = self
+            .candidates()
+            .filter(|s| s.id != primary.id)
+            .filter(|s| !self.recently_failed(&s.id))
+            .filter(|s| sont_xray::supports(&s.transport))
+            .collect();
+
+        ranked.sort_by_key(|s| {
+            self.probes
+                .get(&s.id)
+                .map_or(u32::MAX - 1, ProbeResult::score)
+        });
+        ranked.truncate(crate::race::LANES.saturating_sub(1));
+
+        std::iter::once(primary.clone())
+            .chain(ranked.into_iter().cloned())
+            .collect()
+    }
+
+    /// Волен ли демон сам решать, на какой сервер идти.
+    fn picks_the_server_itself(&self) -> bool {
+        match &self.desired {
+            // Пользователь назвал сервер в самой команде подключения.
+            Desired::Connected { server: Some(_) } => false,
+            Desired::Connected { server: None } => {
+                self.settings.auto_select_server || self.settings.pinned_server.is_none()
+            }
+            Desired::Disconnected => false,
+        }
+    }
+
+    /// Гонка увела попытку на другой сервер.
+    ///
+    /// Состояние обязано это отразить сразу: иначе пользователь смотрит на имя
+    /// сервера, к которому демон уже не подключается, и узнаёт правду только
+    /// из «Подключено» с третьим названием.
+    ///
+    /// В штрафной ящик проигравший при этом не идёт. Проигрыш в гонке — это не
+    /// отказ: сервер мог просто оказаться медленнее победителя. Ящик заведён
+    /// для тех, у кого туннель разваливался, и записывать туда за медлительность
+    /// значит на десять минут вычёркивать исправные серверы.
+    fn adopt_chosen_server(&mut self, server: ProfileId) {
+        let Some(current) = self.state.server().cloned() else {
+            return;
+        };
+        if current == server {
+            return;
+        }
+
+        tracing::info!(from = %current, to = %server, "проверка выбрала другой сервер");
+
+        let state = match &self.state {
+            TunnelState::Connecting { attempt, .. } => TunnelState::Connecting {
+                server,
+                attempt: *attempt,
+            },
+            TunnelState::Reconnecting { cause, attempt, .. } => TunnelState::Reconnecting {
+                server,
+                cause: cause.clone(),
+                attempt: *attempt,
+            },
+            // Попытка уже никому не нужна: её результат отбросят по номеру
+            // поколения, и трогать состояние тем более незачем.
+            _ => return,
+        };
+        self.set_state(state);
     }
 
     /// Пересобирает соединение под изменившиеся настройки.
@@ -1333,7 +1545,7 @@ impl Supervisor {
         self.set_state(state);
 
         let previous = self.active.take();
-        if let Err(e) = self.launch(target, previous, Duration::ZERO) {
+        if let Err(e) = self.launch(target, previous, Duration::ZERO, Selection::Fixed) {
             tracing::error!(error = %e, "не удалось применить настройки к соединению");
             self.fail(e);
         }
@@ -1368,7 +1580,7 @@ impl Supervisor {
             // попыток, дело всё-таки может быть в нём.
             self.next_server(current.as_ref())
         } else {
-            current
+            current.clone()
         };
 
         let Some(target) = target else {
@@ -1377,11 +1589,12 @@ impl Supervisor {
             return;
         };
 
-        let delay = reconnect_delay(attempt);
+        let delay = reconnect_delay_for(attempt, Some(&target) == current.as_ref());
+
         tracing::warn!(
             attempt,
             server = %target,
-            delay_secs = delay.as_secs(),
+            delay_ms = delay.as_millis(),
             ?cause,
             "восстанавливаю соединение"
         );
@@ -1393,7 +1606,7 @@ impl Supervisor {
         });
 
         let previous = self.active.take();
-        if let Err(e) = self.launch(target, previous, delay) {
+        if let Err(e) = self.launch(target, previous, delay, Selection::Race) {
             // Ошибка на этом шаге означает негодный профиль, а не обрыв:
             // повторять с тем же результатом смысла нет.
             tracing::error!(error = %e, "не удалось начать восстановление");
@@ -1508,10 +1721,20 @@ impl Supervisor {
             || !self
                 .servers
                 .iter()
+                .filter(|s| sont_xray::supports(&s.transport))
                 .any(|s| preferred.contains(&s.transport.kind()));
 
         self.servers
             .iter()
+            // Сервер, которого ядро не умеет, не кандидат ни при каких
+            // предпочтениях.
+            //
+            // Раньше он попадал в выбор наравне с прочими, и подключение к
+            // нему обрывалось окончательным отказом: «протокол не
+            // поддерживается» — приговор профилю, а демон принимал его за
+            // приговор всей попытке и снимал намерение. Один такой сервер в
+            // подписке выключал автоподключение целиком.
+            .filter(|s| sont_xray::supports(&s.transport))
             .filter(move |s| usable || preferred.contains(&s.transport.kind()))
     }
 
@@ -1556,7 +1779,14 @@ impl Supervisor {
         // А вот незапускающееся ядро — отсутствующий файл, несошедшийся хэш,
         // неподдерживаемый протокол — само не починится, и повторять тут
         // нечего.
-        if matches!(error, TunnelError::CoreStartFailed { .. }) {
+        //
+        // Именно незапускающееся, а не «не запустившееся в этот раз». Разницу
+        // несёт признак `permanent`, и без него здесь пропадало соединение
+        // после смены настроек: новое ядро поднималось поверх ещё не
+        // отпущенного порта, выходило, отказ считался окончательным — и демон
+        // снимал намерение, хотя достаточно было повторить через секунду.
+        if matches!(error, TunnelError::CoreStartFailed { permanent: true, .. }) {
+            tracing::warn!(%error, "отказ окончательный, намерение снимается");
             self.desired = Desired::Disconnected;
         }
         self.reconnect_attempt = 0;
@@ -1715,6 +1945,12 @@ impl Supervisor {
 
     fn handle_internal(&mut self, msg: Internal) {
         match msg {
+            Internal::ServerChosen { generation, server } => {
+                if generation == self.generation {
+                    self.adopt_chosen_server(server);
+                }
+            }
+
             Internal::CoreStarted { generation, result } => {
                 if generation != self.generation {
                     tracing::debug!(
@@ -2081,6 +2317,40 @@ impl Supervisor {
     }
 }
 
+/// Находит среди кандидатов сервер, который действительно проводит трафик.
+///
+/// # Почему не хватает замера
+///
+/// Замер доказывает только то, что до сервера доходит TCP. Порт отвечает и у
+/// сервера с истёкшим ключом, и у сервера, с которого сняли ядро, а Reality на
+/// чужой ClientHello отвечает настоящим рукопожатием — он для того и устроен,
+/// чтобы выглядеть обычным сайтом. Проверить сервер, не проведя через него
+/// запрос, нельзя, и попытки обойтись более дешёвой проверкой отсеивают только
+/// совсем мёртвые адреса.
+///
+/// # Почему это не растягивает подключение
+///
+/// Запрос проводится не подключением, а гонкой: одно ядро, у каждого кандидата
+/// своя дорожка, все дорожки идут одновременно (см. [`crate::race`]). Победитель
+/// известен через секунду и известен наверняка — а прежний перебор по одному
+/// стоил полного срока подключения на каждом негодном сервере.
+///
+/// Возвращает выбранный сервер: победителя гонки, а при её неудаче — того, кого
+/// назвало ранжирование. Молчание всех дорожек значит «сеть не работает», а не
+/// «серверы негодны», и подменять этим причину отказа нельзя.
+async fn choose_working(
+    launcher: &CoreLauncher,
+    pool: Vec<ServerProfile>,
+    settings: &Settings,
+    config_path: &std::path::Path,
+) -> Option<ServerProfile> {
+    let winner = crate::race::fastest_working(launcher, &pool, config_path, &settings.log_level)
+        .await?
+        .server;
+
+    pool.into_iter().find(|s| s.id == winner)
+}
+
 /// Поднимает ядро и убеждается, что трафик через туннель действительно ходит.
 ///
 /// Порядок шагов выбран так, чтобы каждая неудача давала пользователю точную
@@ -2094,20 +2364,29 @@ async fn start_core(
     config_path: &std::path::Path,
 ) -> Result<Started, TunnelError> {
     let config = sont_xray::build(profile, settings, runtime).map_err(|e| {
+        // Навсегда: конфигурацию для этого профиля не собрать ни сейчас, ни
+        // через минуту.
         TunnelError::CoreStartFailed {
             detail: e.to_string(),
+            permanent: true,
         }
     })?;
 
     write_core_config(config_path, &config).map_err(|e| TunnelError::CoreStartFailed {
+        // Не навсегда: файл мог быть занят антивирусом или прошлым ядром,
+        // которое ещё не отпустило дескриптор.
         detail: format!("не удалось записать конфигурацию ядра: {e}"),
+        permanent: false,
     })?;
 
     let mut core = launcher
         .spawn(config_path)
         .await
         .map_err(|e| TunnelError::CoreStartFailed {
+            // Навсегда: бинаря нет, хэш не сошёлся, запускать нечего. Это
+            // чинится переустановкой, а не повтором.
             detail: e.to_string(),
+            permanent: true,
         })?;
 
     let socks: std::net::SocketAddr =
@@ -2137,11 +2416,21 @@ async fn start_core(
             };
 
             return Err(if crate::core::looks_like_permission_error(&detail) {
+                // Навсегда: без прав администратора адаптер не создать, и
+                // повторы этого не изменят — нужен перезапуск службы.
                 TunnelError::CoreStartFailed {
                     detail: "нужны права администратора: создание сетевого адаптера требует их".to_owned(),
+                    permanent: true,
                 }
             } else {
-                TunnelError::CoreStartFailed { detail }
+                // А вот здесь — не навсегда, и это главный случай.
+                //
+                // Ядро запустилось, значит установка цела. Вышло оно из-за
+                // чего-то, что относится к этой попытке: порт ещё держит
+                // погашенный экземпляр, TUN-адаптер не успел освободиться,
+                // конфигурация переписывалась под ним. Ровно так и выглядит
+                // смена настроек, где новое ядро поднимается сразу за старым.
+                TunnelError::CoreStartFailed { detail, permanent: false }
             });
         }
     };
@@ -2339,34 +2628,35 @@ async fn fetch_counters(url: &str) -> Option<sont_xray::metrics::Counters> {
 /// Сколько ждём ответа сервера после запуска ядра.
 ///
 /// Рукопожатие Reality с XHTTP на живом сервере укладывается в доли секунды;
-/// если ответа нет и через пятнадцать, дело не в медленной сети.
-const READY_TIMEOUT: Duration = Duration::from_secs(15);
+/// если ответа нет и через семь, дело не в медленной сети, а в сервере — и
+/// ждать дальше значит откладывать переход на тот, который работает.
+const READY_TIMEOUT: Duration = Duration::from_secs(7);
 
 /// Сколько ждём, пока система переключится на туннель.
 ///
 /// Отдельный, более короткий срок: маршруты Windows устанавливает быстро, и
 /// если за это время системный трафик не пошёл через туннель, дело не в
 /// задержке, а в том, что маршрут удерживает кто-то другой.
-const ROUTING_TIMEOUT: Duration = Duration::from_secs(10);
+const ROUTING_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Шаг опроса при проверках.
 ///
 /// Подключение завершается по первой удачной попытке, поэтому шаг напрямую
 /// определяет, насколько быстро пользователь увидит «Подключено». Частый
 /// опрос localhost ничего не стоит.
-const READY_INTERVAL: Duration = Duration::from_millis(200);
+const READY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Пауза перед первой проверкой маршрутизации.
 ///
 /// Ровно чтобы сетевой слой успел начать работу, а не «на всякий случай»:
 /// дальше решает опрос.
-const SETTLE_GRACE: Duration = Duration::from_millis(200);
+const SETTLE_GRACE: Duration = Duration::from_millis(100);
 
 /// Предел одной попытки проверки.
 ///
 /// Короче общего срока намеренно: зависший запрос не должен занимать весь
 /// цикл, иначе за отведённое время мы сделаем две попытки вместо десятка.
-const PROBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(4);
+const PROBE_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Адрес, возвращающий внешний IP обратившегося.
 ///
@@ -2715,7 +3005,7 @@ fn preferred_or_free_port(preferred: u16) -> u16 {
     }
 }
 
-fn pick_free_port() -> u16 {
+pub fn pick_free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .and_then(|l| l.local_addr())
         .map(|addr| addr.port())
@@ -2748,7 +3038,7 @@ fn tun_info() -> TunInfo {
 /// Файл содержит учётные данные сервера, поэтому кладётся в каталог демона с
 /// ограниченным доступом и перезаписывается атомарно — иначе ядро может
 /// прочитать его наполовину записанным.
-fn write_core_config(path: &std::path::Path, config: &serde_json::Value) -> std::io::Result<()> {
+pub fn write_core_config(path: &std::path::Path, config: &serde_json::Value) -> std::io::Result<()> {
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
@@ -3996,11 +4286,101 @@ mod tests {
             generation: sup.generation,
             result: Box::new(Err(TunnelError::CoreStartFailed {
                 detail: "файла ядра нет".into(),
+                permanent: true,
             })),
         });
 
         assert_eq!(sup.state.kind(), "failed");
         assert_eq!(sup.desired, Desired::Disconnected);
+    }
+
+    #[tokio::test]
+    async fn a_core_that_failed_once_does_not_cancel_the_intent() {
+        // Ровно та поломка, ради которой заведён признак `permanent`.
+        //
+        // Ядро запустилось и вышло: порт ещё держал погашенный экземпляр.
+        // Считая это окончательным отказом, демон снимал намерение — и после
+        // смены настройки пользователь оставался без соединения навсегда,
+        // хотя достаточно было повторить.
+        let (mut sup, _dir) = make(true);
+        sup.handle(Request::Connect { server: None });
+
+        sup.handle_internal(Internal::CoreStarted {
+            generation: sup.generation,
+            result: Box::new(Err(TunnelError::CoreStartFailed {
+                detail: "ядро завершилось с кодом 23".into(),
+                permanent: false,
+            })),
+        });
+
+        assert!(
+            matches!(sup.desired, Desired::Connected { .. }),
+            "намерение обязано пережить неудачную попытку"
+        );
+        assert_eq!(
+            sup.state.kind(),
+            "reconnecting",
+            "демон обязан пробовать дальше, а не объявлять отказ"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_settings_change_never_leaves_the_user_disconnected() {
+        // Сквозная проверка пути, на котором ломалось: пользователь меняет
+        // настройку, требующую новой конфигурации, ядро не поднимается с
+        // первого раза — и соединение обязано восстановиться само.
+        let (mut sup, _dir) = make(true);
+        sup.handle(Request::Connect { server: None });
+        sup.handle_internal(core_started(sup.generation));
+        assert_eq!(sup.state.kind(), "connected");
+
+        // Смена режима — та самая настройка, что пересобирает ядро.
+        sup.handle(Request::PatchSettings {
+            patch: SettingsPatch {
+                mode: Some(sont_core::ConnectionMode::Proxy),
+                ..Default::default()
+            },
+        });
+        assert_eq!(sup.state.kind(), "reconnecting", "настройка пересобирает ядро");
+
+        // Новое ядро вышло, не успев подняться.
+        sup.handle_internal(Internal::CoreStarted {
+            generation: sup.generation,
+            result: Box::new(Err(TunnelError::CoreStartFailed {
+                detail: "порт занят".into(),
+                permanent: false,
+            })),
+        });
+
+        assert!(
+            matches!(sup.desired, Desired::Connected { .. }),
+            "смена настройки не вправе выключать VPN"
+        );
+        assert!(
+            sup.state.holds_a_route(),
+            "демон обязан остаться в попытке, а не осесть в отказе: было {}",
+            sup.state.kind()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_server_the_core_cannot_run_is_never_chosen() {
+        // Иначе один такой сервер в подписке выключал автоподключение целиком:
+        // выбор упирался в него, отказ считался окончательным, намерение
+        // снималось.
+        let (mut sup, _dir) = make(true);
+        assert!(
+            sup.candidates().all(|s| sont_xray::supports(&s.transport)),
+            "негодный сервер не должен доходить до выбора"
+        );
+
+        // И даже когда предпочтения указывают ровно на него.
+        sup.settings.preferred_transports = vec![sont_core::TransportKind::Tuic];
+        assert!(sup.candidates().all(|s| sont_xray::supports(&s.transport)));
+        assert!(
+            sup.candidates().next().is_some(),
+            "предпочтение, которому никто не отвечает, не должно опустошать список"
+        );
     }
 
     #[test]
@@ -4200,12 +4580,156 @@ mod tests {
 
     #[test]
     fn backoff_grows_and_is_capped() {
-        assert_eq!(reconnect_delay(1), Duration::from_secs(1));
-        assert_eq!(reconnect_delay(2), Duration::from_secs(2));
-        assert_eq!(reconnect_delay(4), Duration::from_secs(8));
-        assert_eq!(reconnect_delay(10), RECONNECT_MAX_DELAY);
+        // Первая попытка идёт без паузы: восстановление обязано начинаться так
+        // же быстро, как подключение по кнопке. Пользователю разницы между
+        // ними нет — и там, и там он ждёт сети.
+        assert_eq!(reconnect_delay(1), Duration::ZERO);
+
+        assert_eq!(reconnect_delay(2), RECONNECT_BASE_DELAY);
+        assert_eq!(reconnect_delay(3), Duration::from_millis(500));
+        assert_eq!(reconnect_delay(5), Duration::from_secs(2));
+        assert_eq!(reconnect_delay(20), RECONNECT_MAX_DELAY);
         // Переполнение при большом числе попыток не должно ломать расчёт.
         assert_eq!(reconnect_delay(u32::MAX), RECONNECT_MAX_DELAY);
+    }
+
+    #[test]
+    fn the_outer_timeout_outlives_the_stages_it_guards() {
+        // Предохранитель обязан срабатывать после этапов, а не вместо них.
+        // Сработай он раньше — и вместо «сервер не отвечает» или «маршрут по
+        // умолчанию удерживает кто-то ещё» пользователь получит
+        // бессодержательное «не успело», а мы потеряем причину.
+        assert!(
+            CONNECT_TIMEOUT > READY_TIMEOUT + SETTLE_GRACE + ROUTING_TIMEOUT,
+            "срок всей последовательности короче суммы её этапов"
+        );
+    }
+
+    #[test]
+    fn another_server_is_tried_without_waiting() {
+        // Пауза наказывает сервер, который только что отказал. Другой сервер
+        // ничем не провинился, и держать перед ним пользователя без сети
+        // столько, сколько накопил счётчик неудач предыдущего, незачем.
+        assert_eq!(reconnect_delay_for(5, false), Duration::ZERO);
+        assert_eq!(reconnect_delay_for(1, false), Duration::ZERO);
+        // А возврат на тот же — по обычной лестнице.
+        assert_eq!(reconnect_delay_for(5, true), reconnect_delay(5));
+    }
+
+    #[tokio::test]
+    async fn a_fallen_server_is_replaced_at_once() {
+        // Проверка того же правила на месте: сервер отказал, демон уходит на
+        // другой — и уходит немедленно.
+        let (mut sup, _dir) = make(true);
+        sup.handle(Request::Connect { server: None });
+        let first = sup.state.server().cloned().unwrap();
+
+        // Счётчик уже накопил неудачи: с прежним расчётом это стоило бы паузы.
+        sup.reconnect_attempt = 6;
+        sup.begin_reconnect(ReconnectCause::CoreExited { code: None });
+
+        let second = sup.state.server().cloned().unwrap();
+        assert_ne!(second, first, "упавший сервер обязан смениться");
+        assert_eq!(
+            reconnect_delay_for(sup.reconnect_attempt, false),
+            Duration::ZERO
+        );
+    }
+
+    // ──────────────────── гонка кандидатов перед запуском ────────────────────
+
+    #[tokio::test]
+    async fn a_pinned_server_never_enters_a_race() {
+        // Пользователь просил именно этот сервер и должен увидеть именно его
+        // отказ, а не молча оказаться в другой стране.
+        let (mut sup, _dir) = make(true);
+        let pinned = sup.servers[1].clone();
+
+        sup.desired = Desired::Connected {
+            server: Some(pinned.id.clone()),
+        };
+        assert!(sup.race_pool(&pinned).is_empty());
+
+        // То же самое, когда сервер закреплён настройкой.
+        sup.desired = Desired::Connected { server: None };
+        sup.settings.auto_select_server = false;
+        sup.settings.pinned_server = Some(pinned.id.clone());
+        assert!(sup.race_pool(&pinned).is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_race_starts_with_the_ranked_server_and_adds_the_best_of_the_rest() {
+        let (mut sup, _dir) = make(true);
+        sup.desired = Desired::Connected { server: None };
+
+        let primary = sup.servers[0].clone();
+        // Один из серверов недавно падал: гонка живёт одной секундой, а
+        // штрафной ящик помнит то, чего она узнать не может.
+        let disgraced = sup.servers[2].id.clone();
+        sup.failed_servers.insert(disgraced.clone(), Instant::now());
+
+        let pool = sup.race_pool(&primary);
+
+        assert_eq!(
+            pool.first().map(|s| &s.id),
+            Some(&primary.id),
+            "выбранный ранжированием сервер обязан участвовать"
+        );
+        assert!(pool.len() > 1, "гонка из одного участника ничего не решает");
+        assert!(pool.len() <= crate::race::LANES);
+        assert_eq!(
+            pool.iter().filter(|s| s.id == primary.id).count(),
+            1,
+            "участник не должен занимать две дорожки"
+        );
+        assert!(
+            pool.iter().all(|s| s.id != disgraced),
+            "недавно упавший сервер в гонку не допускается"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_race_winner_becomes_the_server_on_display() {
+        // Иначе пользователь смотрит на имя сервера, к которому демон уже не
+        // подключается, и узнаёт правду только из «Подключено» с третьим
+        // названием.
+        let (mut sup, _dir) = make(true);
+        sup.handle(Request::Connect { server: None });
+
+        let ranked = sup.state.server().cloned().unwrap();
+        let winner = sup.servers.iter().find(|s| s.id != ranked).unwrap().id.clone();
+
+        sup.handle_internal(Internal::ServerChosen {
+            generation: sup.generation,
+            server: winner.clone(),
+        });
+
+        assert_eq!(sup.state.server(), Some(&winner));
+        assert_eq!(sup.state.kind(), "connecting", "гонка не меняет этап подключения");
+        assert!(
+            !sup.recently_failed(&ranked),
+            "проигрыш в гонке — не отказ: сервер мог оказаться просто медленнее"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_check_result_does_not_move_a_new_attempt() {
+        let (mut sup, _dir) = make(true);
+        sup.handle(Request::Connect { server: None });
+        let stale = sup.generation;
+
+        // Пользователь передумал и попросил другой сервер.
+        let wanted = sup.servers[2].id.clone();
+        sup.handle(Request::Connect {
+            server: Some(wanted.clone()),
+        });
+
+        sup.handle_internal(Internal::ServerChosen {
+            generation: stale,
+            server: sup.servers[3].id.clone(),
+        });
+
+        assert_eq!(sup.state.server(), Some(&wanted));
     }
 
     #[tokio::test]

@@ -51,6 +51,10 @@ pub const PROBE_INBOUND: &str = "probe-in";
 /// Тег входящего HTTP-соединения.
 pub const HTTP_INBOUND: &str = "http-in";
 
+/// Приставка к тегам дорожек гонки серверов. Номер дорожки идёт следом.
+const RACE_INBOUND: &str = "race-in-";
+const RACE_OUTBOUND: &str = "race-out-";
+
 impl Default for RuntimeInfo {
     fn default() -> Self {
         Self {
@@ -149,6 +153,88 @@ pub fn build(
     }
 
     Ok(Value::Object(config))
+}
+
+/// Собирает конфигурацию для одновременной проверки нескольких серверов.
+///
+/// # Зачем отдельная конфигурация
+///
+/// Понять, работает ли сервер, не запуская ядро, нельзя. Ни замер задержки, ни
+/// рукопожатие TLS этого не показывают: до сервера, у которого истёк ключ или
+/// сломана конфигурация, TCP доходит прекрасно, а Reality на чужой ClientHello
+/// честно отвечает тем сайтом, за который себя выдаёт, — то есть выглядит
+/// исправным ровно так же, как исправный.
+///
+/// Проверять по одному значит платить полной последовательностью подключения за
+/// каждый негодный сервер. Здесь все кандидаты проверяются сразу: каждому свой
+/// локальный вход, свой выход и правило, соединяющее их напрямую. Одно ядро,
+/// один запуск, и ответ приходит от того, кто действительно провёл запрос.
+///
+/// # Чего здесь нет
+///
+/// Ни DNS, ни статистики, ни раздельного туннелирования, ни правил для
+/// широковещательного трафика. Через эту конфигурацию проходит ровно один
+/// запрос на дорожку, к адресу-литералу, и всё перечисленное только добавило бы
+/// ей поводов не запуститься.
+pub fn build_race(lanes: &[(&ServerProfile, u16)], log_level: &str) -> Result<Value, BuildError> {
+    if lanes.is_empty() {
+        return Err(BuildError::Unsupported(
+            "гонка без участников не имеет смысла".to_owned(),
+        ));
+    }
+
+    let mut inbounds = Vec::with_capacity(lanes.len());
+    let mut outbounds = Vec::with_capacity(lanes.len() + 1);
+    let mut rules = Vec::with_capacity(lanes.len());
+
+    for (lane, (server, port)) in lanes.iter().enumerate() {
+        if let Some(reason) = support::unsupported_reason(&server.transport) {
+            return Err(BuildError::Unsupported(reason));
+        }
+
+        let inbound_tag = format!("{RACE_INBOUND}{lane}");
+        let outbound_tag = format!("{RACE_OUTBOUND}{lane}");
+
+        inbounds.push(json!({
+            "tag": inbound_tag,
+            "protocol": "socks",
+            "listen": "127.0.0.1",
+            "port": port,
+            // UDP не нужен: проверка — это один запрос HTTPS. А вот разбор
+            // протокола не нужен тем более: адрес назначения известен и задан
+            // литералом, подсматривать в трафик не за чем.
+            "settings": { "auth": "noauth", "udp": false },
+        }));
+
+        let mut outbound = proxy_outbound(server);
+        outbound["tag"] = json!(outbound_tag);
+        outbounds.push(outbound);
+
+        // Дорожки не должны перетекать одна в другую: без правила весь трафик
+        // ушёл бы в первый outbound, и гонку выиграл бы кто попало.
+        rules.push(json!({
+            "type": "field",
+            "inboundTag": [inbound_tag],
+            "outboundTag": outbound_tag,
+        }));
+    }
+
+    // Всё, что почему-либо не подошло ни под одно правило, обязано умереть, а
+    // не уйти мимо проверяемого сервера: иначе дорожка отчитается об успехе,
+    // не пройдя через тот сервер, ради которого заведена.
+    outbounds.push(json!({ "tag": BLOCK, "protocol": "blackhole" }));
+    rules.push(json!({
+        "type": "field",
+        "network": "tcp,udp",
+        "outboundTag": BLOCK,
+    }));
+
+    Ok(json!({
+        "log": { "loglevel": core_log_level(log_level), "access": "none" },
+        "inbounds": inbounds,
+        "outbounds": outbounds,
+        "routing": { "rules": rules },
+    }))
 }
 
 /// Уровень журналирования ядра.
@@ -615,6 +701,7 @@ mod tests {
     fn build_ok(server: &ServerProfile, settings: &Settings) -> Value {
         build(server, settings, &RuntimeInfo::default()).expect("конфиг должен собраться")
     }
+
 
     #[test]
     fn xhttp_reality_produces_the_expected_outbound() {
@@ -1195,5 +1282,122 @@ mod tests {
         for key in ["log", "inbounds", "outbounds", "dns", "routing"] {
             assert!(cfg.get(key).is_some(), "нет секции {key}");
         }
+    }
+
+    // ─────────────────────────── гонка серверов ───────────────────────────
+
+    fn named(name: &str, host: &str) -> ServerProfile {
+        ServerProfile::new(
+            name,
+            Endpoint::new(host, 443),
+            Transport::Vless(Vless {
+                uuid: Secret::new("11111111-2222-3333-4444-555555555555"),
+                flow: None,
+                stream: Stream::Tcp,
+                security: Security::Tls(Tls::default()),
+            }),
+            source(),
+        )
+    }
+
+    #[test]
+    fn every_lane_gets_its_own_entrance_exit_and_rule() {
+        // Дорожки не должны перетекать одна в другую: без правила весь трафик
+        // ушёл бы в первый outbound, и гонку выиграл бы кто попало.
+        let first = named("первый", "198.51.100.1");
+        let second = named("второй", "198.51.100.2");
+        let cfg = build_race(&[(&first, 30001), (&second, 30002)], "warning").unwrap();
+
+        let inbounds = cfg["inbounds"].as_array().unwrap();
+        assert_eq!(inbounds.len(), 2);
+        assert_eq!(inbounds[0]["port"], 30001);
+        assert_eq!(inbounds[1]["port"], 30002);
+        assert_eq!(inbounds[0]["listen"], "127.0.0.1", "вход обязан быть локальным");
+
+        let outbounds = cfg["outbounds"].as_array().unwrap();
+        assert_eq!(outbounds[0]["settings"]["vnext"][0]["address"], "198.51.100.1");
+        assert_eq!(outbounds[1]["settings"]["vnext"][0]["address"], "198.51.100.2");
+
+        let rules = cfg["routing"]["rules"].as_array().unwrap();
+        for lane in 0..2 {
+            assert_eq!(rules[lane]["inboundTag"][0], inbounds[lane]["tag"]);
+            assert_eq!(rules[lane]["outboundTag"], outbounds[lane]["tag"]);
+        }
+    }
+
+    #[test]
+    fn tags_do_not_collide_between_lanes() {
+        // Совпади теги — и Xray отдал бы обе дорожки одному серверу, а гонка
+        // объявила бы победителем того, через кого запрос не шёл.
+        let a = named("первый", "198.51.100.1");
+        let b = named("второй", "198.51.100.2");
+        let c = named("третий", "198.51.100.3");
+        let cfg = build_race(&[(&a, 30001), (&b, 30002), (&c, 30003)], "warning").unwrap();
+
+        let tags: Vec<&str> = cfg["inbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .chain(cfg["outbounds"].as_array().unwrap())
+            .map(|v| v["tag"].as_str().unwrap())
+            .collect();
+
+        let unique: std::collections::HashSet<&&str> = tags.iter().collect();
+        assert_eq!(unique.len(), tags.len(), "теги дорожек обязаны быть разными");
+    }
+
+    #[test]
+    fn unmatched_traffic_dies_rather_than_leaks_past_the_server() {
+        // Иначе дорожка отчиталась бы об успехе, не пройдя через тот сервер,
+        // ради которого заведена, — и гонку выиграл бы неработающий.
+        let one = named("первый", "198.51.100.1");
+        let cfg = build_race(&[(&one, 30001)], "warning").unwrap();
+
+        let outbounds = cfg["outbounds"].as_array().unwrap();
+        assert!(
+            outbounds.iter().all(|o| o["protocol"] != "freedom"),
+            "прямого выхода в конфигурации проверки быть не должно"
+        );
+
+        let rules = cfg["routing"]["rules"].as_array().unwrap();
+        assert_eq!(rules.last().unwrap()["outboundTag"], BLOCK);
+    }
+
+    #[test]
+    fn the_check_config_carries_nothing_it_does_not_need() {
+        // Через неё проходит один запрос к адресу-литералу. DNS, статистика и
+        // раздельное туннелирование добавили бы ей только поводов не запуститься.
+        let one = named("первый", "198.51.100.1");
+        let cfg = build_race(&[(&one, 30001)], "warning").unwrap();
+
+        for key in ["dns", "stats", "metrics", "policy"] {
+            assert!(cfg.get(key).is_none(), "лишняя секция {key}");
+        }
+        assert_eq!(cfg["log"]["access"], "none");
+    }
+
+    #[test]
+    fn a_race_without_participants_is_refused() {
+        assert!(build_race(&[], "warning").is_err());
+    }
+
+    #[test]
+    fn an_unsupported_server_cannot_become_a_lane() {
+        // Иначе один негодный профиль в подписке отменял бы сборку всей
+        // проверки — то есть лишал бы её смысла для остальных.
+        let tuic = ServerProfile::new(
+            "tuic",
+            Endpoint::new("198.51.100.9", 443),
+            Transport::Tuic(Tuic {
+                uuid: Secret::new("11111111-2222-3333-4444-555555555555"),
+                password: Secret::new("pw"),
+                congestion_control: "bbr".into(),
+                udp_relay_mode: "native".into(),
+                tls: Tls::default(),
+            }),
+            source(),
+        );
+
+        assert!(build_race(&[(&tuic, 30001)], "warning").is_err());
     }
 }

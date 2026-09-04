@@ -108,6 +108,26 @@ impl Default for DnsSettings {
     }
 }
 
+/// Светлое окно, тёмное или как в системе.
+///
+/// Настройка касается только окна, но живёт здесь, вместе с прочими: своего
+/// состояния у окна нет, оно спрашивает демон и рисует ответ. Отдельный файл
+/// настроек трея завёл бы вторую истину, расходящуюся с первой после первой же
+/// команды из CLI. По той же причине здесь и [`Settings::system_accent`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Theme {
+    /// Как в параметрах Windows, и меняется вместе с ними.
+    ///
+    /// Значение по умолчанию: приложение, которое светится белым в тёмной
+    /// системе, выглядит чужим — а угадывать за пользователя то, что он уже
+    /// один раз выбрал в параметрах, незачем.
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
 /// Как трактовать список приложений в раздельном туннелировании.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -210,6 +230,9 @@ pub struct Settings {
     /// файл настроек трея завёл бы вторую истину, расходящуюся с первой при
     /// первой же команде из CLI.
     pub system_accent: bool,
+    /// Светлое окно, тёмное или как в системе.
+    #[serde(default)]
+    pub theme: Theme,
 }
 
 impl Default for Settings {
@@ -250,6 +273,7 @@ impl Default for Settings {
             // По умолчанию окно держит собственный цвет: менять облик
             // приложения без спроса — не то, чего ждут от установки.
             system_accent: false,
+            theme: Theme::default(),
         }
     }
 }
@@ -282,6 +306,7 @@ pub struct SettingsPatch {
     pub log_level: Option<String>,
     pub language: Option<String>,
     pub system_accent: Option<bool>,
+    pub theme: Option<Theme>,
 }
 
 impl SettingsPatch {
@@ -369,6 +394,9 @@ impl SettingsPatch {
         }
         if let Some(v) = self.system_accent {
             settings.system_accent = v;
+        }
+        if let Some(v) = self.theme {
+            settings.theme = v;
         }
 
         outcome
@@ -469,6 +497,38 @@ mod tests {
     fn switching_servers_is_off_by_default() {
         // Демон не рвёт соединения по своей инициативе, пока его не попросят.
         assert!(!Settings::default().auto_switch);
+    }
+
+    #[test]
+    fn the_window_follows_the_system_theme_until_told_otherwise() {
+        // Приложение, светящееся белым в тёмной системе, выглядит чужим — а
+        // выбор пользователь уже сделал в параметрах Windows.
+        assert_eq!(Settings::default().theme, Theme::System);
+    }
+
+    #[test]
+    fn changing_the_theme_does_not_touch_the_connection() {
+        // Настройка чисто внешняя. Перезапусти ядро ради цвета окна — и
+        // пользователь получит обрыв связи за нажатие на «Светлая».
+        let mut s = Settings::default();
+        let outcome = SettingsPatch {
+            theme: Some(Theme::Light),
+            ..Default::default()
+        }
+        .apply(&mut s);
+
+        assert_eq!(s.theme, Theme::Light);
+        assert!(!outcome.needs_core_restart);
+        assert!(!outcome.needs_firewall_reapply);
+    }
+
+    #[test]
+    fn settings_saved_before_the_theme_existed_still_load() {
+        // Файл настроек переживает обновление приложения: отсутствие поля
+        // означает «как в системе», а не отказ прочитать файл целиком.
+        let json = r#"{"language":"ru"}"#;
+        let s: Settings = serde_json::from_str(json).expect("старый файл обязан читаться");
+        assert_eq!(s.theme, Theme::System);
     }
 
     #[test]

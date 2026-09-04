@@ -39,8 +39,8 @@
     padding: 0;
     border: 0;
     border-radius: 3px;
-    background: rgba(244, 237, 229, 0.12);
-    color: var(--cream);
+    background: rgba(var(--fg-rgb), 0.12);
+    color: var(--fg);
     font-family: inherit;
     font-size: 10px;
     line-height: 1;
@@ -60,6 +60,6 @@
     font-size: 10px;
     font-weight: 500;
     line-height: 130%;
-    color: var(--cream);
+    color: var(--fg);
   }
 </style>
