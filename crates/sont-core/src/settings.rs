@@ -203,11 +203,6 @@ pub struct Settings {
     /// Насколько новый сервер должен быть быстрее, чтобы ради него рвать
     /// соединение, миллисекунды.
     pub switch_threshold_ms: u32,
-    /// Сколько раз демон бьётся в тот же сервер, прежде чем взять другой.
-    ///
-    /// Считается только для причин, не связанных с самим сервером: упавший
-    /// сервер меняется сразу.
-    pub reconnect_attempts: u32,
     /// Закреплённый пользователем сервер (используется, если автовыбор выключен).
     pub pinned_server: Option<crate::profile::ProfileId>,
     pub firewall: FirewallMode,
@@ -260,7 +255,6 @@ impl Default for Settings {
             // работе. Меньше — это шум замера, ради которого рвать соединения
             // не стоит.
             switch_threshold_ms: 30,
-            reconnect_attempts: 3,
             pinned_server: None,
             firewall: FirewallMode::default(),
             dns: DnsSettings::default(),
@@ -293,7 +287,6 @@ pub struct SettingsPatch {
     pub probe_interval_secs: Option<u32>,
     pub auto_switch: Option<bool>,
     pub switch_threshold_ms: Option<u32>,
-    pub reconnect_attempts: Option<u32>,
     /// `Some(None)` снимает закрепление, `None` оставляет как было.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pinned_server: Option<Option<crate::profile::ProfileId>>,
@@ -349,9 +342,6 @@ impl SettingsPatch {
             // Нулевой порог означал бы переподключение на каждом дрожании
             // замера — это не «лучший сервер», а разрыв соединений без повода.
             settings.switch_threshold_ms = v.max(1);
-        }
-        if let Some(v) = self.reconnect_attempts {
-            settings.reconnect_attempts = v.clamp(1, 9);
         }
         if let Some(v) = self.pinned_server {
             settings.pinned_server = v;
@@ -450,26 +440,22 @@ mod tests {
         SettingsPatch {
             probe_interval_secs: Some(0),
             switch_threshold_ms: Some(0),
-            reconnect_attempts: Some(0),
             ..Default::default()
         }
         .apply(&mut s);
 
         assert!(s.probe_interval_secs >= 15);
         assert!(s.switch_threshold_ms >= 1);
-        assert!(s.reconnect_attempts >= 1);
 
         // Сверху тоже: замер раз в сутки — это отсутствие замера, а девять
         // попыток и так предел, заданный интерфейсом.
         SettingsPatch {
             probe_interval_secs: Some(u32::MAX),
-            reconnect_attempts: Some(u32::MAX),
             ..Default::default()
         }
         .apply(&mut s);
 
         assert!(s.probe_interval_secs <= 3600);
-        assert!(s.reconnect_attempts <= 9);
     }
 
     #[test]
@@ -481,7 +467,6 @@ mod tests {
             probe_interval_secs: Some(60),
             auto_switch: Some(true),
             switch_threshold_ms: Some(50),
-            reconnect_attempts: Some(5),
             ..Default::default()
         }
         .apply(&mut s);
@@ -489,7 +474,6 @@ mod tests {
         assert_eq!(s.probe_interval_secs, 60);
         assert!(s.auto_switch);
         assert_eq!(s.switch_threshold_ms, 50);
-        assert_eq!(s.reconnect_attempts, 5);
         assert!(!outcome.needs_core_restart);
     }
 

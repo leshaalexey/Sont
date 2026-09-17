@@ -123,10 +123,35 @@ fn utc_time_of_day() -> String {
     )
 }
 
+/// Пишет паники в журнал.
+///
+/// У службы нет консоли, и стандартный обработчик печатал сообщение паники в
+/// никуда. Паника в задаче рантайма при этом не роняет процесс — задача просто
+/// исчезает, — так что от неё не оставалось ни строки, ни кода выхода: демон
+/// продолжал жить без части себя, и понять, что произошло, было не из чего.
+///
+/// Ставится один раз: повторная инициализация в тестах иначе вкладывала бы
+/// обработчики друг в друга.
+fn log_panics() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let default = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let thread = std::thread::current();
+            tracing::error!(
+                thread = thread.name().unwrap_or("безымянный"),
+                "паника: {info}"
+            );
+            default(info);
+        }));
+    });
+}
+
 /// Настраивает вывод в консоль и кольцевой буфер.
 ///
 /// Уровень берётся из `SONT_LOG`, иначе из переданного значения.
 pub fn init(default_level: &str) -> LogBuffer {
+    log_panics();
     let buffer = LogBuffer::new();
 
     let registry = tracing_subscriber::registry()
@@ -152,6 +177,7 @@ pub fn init(default_level: &str) -> LogBuffer {
 /// закрывает поток записи, и последние строки — как раз те, что объясняют
 /// падение, — теряются.
 pub fn init_to_file(default_level: &str, dir: &std::path::Path) -> (LogBuffer, WorkerGuard) {
+    log_panics();
     let buffer = LogBuffer::new();
 
     let appender = tracing_appender::rolling::daily(dir, "sontd.log");
@@ -186,8 +212,13 @@ pub fn init_to_file(default_level: &str, dir: &std::path::Path) -> (LogBuffer, W
 /// Их собственная настройка подробности тут не помогает: они пишут через
 /// `tracing`, и уровень им задаёт наш подписчик, а не переданный им аргумент.
 ///
-/// Предупреждения и ошибки остаются: именно они и нужны.
-const NOISY: [&str; 2] = ["tun2proxy=warn", "ipstack=warn"];
+/// Предупреждения и ошибки `tun2proxy` остаются: именно они и нужны.
+///
+/// У `ipstack` — только ошибки. Его предупреждение «истёк срок сессии» пишется
+/// на каждое соединение, и когда приложение перебирает недоступные узлы, это
+/// десятки тысяч строк за минуты: у пользователя они заняли девяносто девять
+/// процентов журнала как раз в те минуты, которые надо было разобрать.
+const NOISY: [&str; 2] = ["tun2proxy=warn", "ipstack=error"];
 
 fn filter(default_level: &str) -> EnvFilter {
     // Своё значение из переменной окружения уважаем целиком: если человек

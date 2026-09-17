@@ -49,7 +49,6 @@ const DICT = {
 
     "allowLan.title": "Пускать локальную сеть напрямую",
     "allowLan.hint": "Принтеры, NAS и веб-интерфейс роутера отвечают быстрее, минуя туннель",
-    "attempts.title": "Попыток до смены сервера",
     "killSwitch.title": "Обрывать всё, пока туннеля нет",
     "killSwitch.hint": "Обрыв соединения не выпустит трафик наружу: пока связь восстанавливается, из машины не уходит ничего. Жёсткий режим держит запрет и после падения демона — снять его можно командой sontd firewall reset",
     "fw.off": "Выкл",
@@ -136,7 +135,6 @@ const DICT = {
 
     "allowLan.title": "Send local traffic direct",
     "allowLan.hint": "Printers, NAS and the router page answer faster, skipping the tunnel",
-    "attempts.title": "Retry attempts",
     "killSwitch.title": "Cut everything while the tunnel is down",
     "killSwitch.hint": "A dropped link no longer leaks: nothing leaves the machine while it is being restored. Lockdown holds the block even if the daemon dies — lift it with sontd firewall reset",
     "fw.off": "Off",

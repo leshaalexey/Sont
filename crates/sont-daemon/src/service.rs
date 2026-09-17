@@ -107,7 +107,27 @@ fn configure_restart_on_failure(service: &windows_service::service::Service) -> 
     };
 
     service.update_failure_actions(actions)?;
+
+    // Перезапуск и после остановки с кодом ошибки, а не только после падения.
+    // Иначе демон, завершившийся с внятной причиной — например, погибший
+    // IPC-сервер, — остаётся лежать: диспетчер видит штатную остановку.
+    service.set_failure_actions_on_non_crash_failures(true)?;
     Ok(())
+}
+
+/// Приводит настройки перезапуска уже установленной службы к нынешним.
+///
+/// Установка пишет их один раз, и службы, поставленные прежними версиями, жили
+/// бы со старыми до переустановки. Демон работает от LocalSystem и может
+/// поправить их сам при каждом старте.
+pub fn refresh_restart_on_failure() {
+    let result = manager(ServiceManagerAccess::CONNECT).and_then(|manager| {
+        let service = manager.open_service(SERVICE_NAME, ServiceAccess::CHANGE_CONFIG)?;
+        configure_restart_on_failure(&service)
+    });
+    if let Err(e) = result {
+        tracing::warn!(error = %e, "не удалось обновить перезапуск службы при сбое");
+    }
 }
 
 /// Удаляет службу.

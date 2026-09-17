@@ -58,7 +58,6 @@ const PREVIEW = {
     probe_interval_secs: 60,
     auto_switch: true,
     switch_threshold_ms: 30,
-    reconnect_attempts: 3,
     allow_lan: true,
     firewall: "auto",
     preferred_transports: [],

@@ -123,15 +123,6 @@
     />
   </Row>
 
-  <BoxedRow label={$t("attempts.title")}>
-    <Stepper
-      value={$settings.reconnect_attempts}
-      min={1}
-      max={9}
-      onchange={(v) => patch({ reconnect_attempts: v })}
-    />
-  </BoxedRow>
-
 {/if}
 
 <style>

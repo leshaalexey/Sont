@@ -84,6 +84,24 @@ impl Link {
 /// Сколько ждём службу после запроса на запуск.
 const DAEMON_WAIT: Duration = Duration::from_secs(12);
 
+/// Сколько даём одному рукопожатию с демоном.
+///
+/// Живой демон отвечает за миллисекунды. Зависший держал канал открытым и не
+/// отвечал вовсе, а окно ждало без срока: запущенное утром, оно не показало ни
+/// ошибки, ни состояния, будто и не запускалось.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Одна попытка соединиться с демоном — со сроком.
+async fn connect_once(addr: &str) -> Result<(Client, tokio::sync::mpsc::Receiver<Event>), String> {
+    match tokio::time::timeout(HANDSHAKE_TIMEOUT, Client::connect(addr, AGENT)).await {
+        Ok(result) => result.map_err(|e| e.to_string()),
+        Err(_) => Err(format!(
+            "демон не ответил на рукопожатие за {} с",
+            HANDSHAKE_TIMEOUT.as_secs()
+        )),
+    }
+}
+
 /// Сколько ждём, если запрошено повышение прав.
 ///
 /// В этот срок укладывается не только запуск службы, но и время, пока
@@ -103,7 +121,7 @@ const ELEVATED_WAIT: Duration = Duration::from_secs(90);
 async fn connect_or_start() -> Result<(Client, tokio::sync::mpsc::Receiver<Event>), String> {
     let addr = sont_ipc::endpoint_name();
 
-    match Client::connect(&addr, AGENT).await {
+    match connect_once(&addr).await {
         Ok(pair) => return Ok(pair),
         Err(e) => tracing::info!(error = %e, "демон не отвечает, поднимаю службу"),
     }
@@ -116,7 +134,7 @@ async fn connect_or_start() -> Result<(Client, tokio::sync::mpsc::Receiver<Event
     let mut last = String::new();
     while std::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(400)).await;
-        match Client::connect(&addr, AGENT).await {
+        match connect_once(&addr).await {
             Ok(pair) => {
                 tracing::info!("демон поднялся");
                 return Ok(pair);
@@ -1743,6 +1761,22 @@ fn toggle_window(app: &AppHandle) {
     let _ = app.emit("sont://show", ());
 }
 
+/// Пишет паники в журнал.
+///
+/// У окна нет консоли, и стандартный обработчик печатал сообщение в никуда:
+/// значок исчезал из трея, не оставив ни строки о причине.
+fn log_panics() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        tracing::error!(
+            thread = thread.name().unwrap_or("безымянный"),
+            "паника: {info}"
+        );
+        default(info);
+    }));
+}
+
 /// Заводит журнал в файл рядом с журналом демона.
 ///
 /// У окна нет консоли — иначе оно мигало бы чёрным прямоугольником при каждом
@@ -1762,6 +1796,8 @@ fn setup_logging() -> Option<tracing_appender::non_blocking::WorkerGuard> {
 
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| "info".into());
+
+    log_panics();
 
     // Каталог может быть недоступен на запись: демон работает от системы, а
     // окно — от пользователя. Тогда остаёмся без журнала, но не без окна.
@@ -1898,10 +1934,20 @@ fn main() {
 
             if let Some(window) = handle.get_webview_window("main") {
                 let owner = handle.clone();
-                window.on_window_event(move |event| {
-                    if let tauri::WindowEvent::Focused(false) = event {
-                        start_hiding(&owner);
+                let panel = window.clone();
+                window.on_window_event(move |event| match event {
+                    tauri::WindowEvent::Focused(false) => start_hiding(&owner),
+                    // Окно не закрывается, а прячется.
+                    //
+                    // Закрытое окно уничтожается, а вместе с последним окном
+                    // Tauri завершает и приложение: Alt+F4 на панели убирал
+                    // значок из трея и гасил агента сеанса. Панель у трея одна
+                    // на всё время работы, и показывать потом было бы нечего.
+                    tauri::WindowEvent::CloseRequested { api, .. } => {
+                        api.prevent_close();
+                        let _ = panel.hide();
                     }
+                    _ => {}
                 });
             }
 
@@ -1947,8 +1993,21 @@ fn main() {
         })
         .build(tauri::generate_context!())
         .expect("не удалось собрать окно трея")
-        .run(|app, event| {
-            if let tauri::RunEvent::Exit = event {
+        .run(|app, event| match event {
+            // Выход без кода — это не «Выход» из меню (тот передаёт код), а
+            // решение самого Tauri: закрылось последнее окно. Для приложения в
+            // трее это не повод завершаться — значок исчез бы молча, и сеть
+            // осталась бы без присмотра окна. Причину пишем: раньше такой уход
+            // не оставлял в журнале ничего.
+            tauri::RunEvent::ExitRequested { code: None, api, .. } => {
+                tracing::warn!("закрылось последнее окно — трей остаётся работать");
+                api.prevent_exit();
+            }
+            tauri::RunEvent::ExitRequested { code, .. } => {
+                tracing::info!(?code, "выход по команде пользователя");
+            }
+            tauri::RunEvent::Exit => {
+                tracing::info!("окно трея завершается");
                 // Оставленный агент продолжит держать настройки прокси, за
                 // которыми уже никто не следит. Снимаем его вместе с собой.
                 if let Some(mut child) = app.state::<Agent>().0.lock().ok().and_then(|mut a| a.take())
@@ -1956,5 +2015,6 @@ fn main() {
                     let _ = child.kill();
                 }
             }
+            _ => {}
         });
 }

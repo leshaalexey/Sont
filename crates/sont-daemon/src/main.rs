@@ -9,6 +9,8 @@ mod connections;
 mod core;
 mod demo;
 mod firewall;
+#[cfg(windows)]
+mod lanroute;
 mod logging;
 mod paths;
 mod probe;
@@ -21,6 +23,7 @@ mod subscription;
 mod supervisor;
 mod sysproxy;
 mod tunnel;
+mod watchdog;
 mod winhttp;
 
 use std::sync::Arc;
@@ -378,6 +381,13 @@ async fn run_daemon(options: DaemonOptions, stop: impl std::future::Future<Outpu
         (logging::init("info"), None)
     };
 
+    // Служба, поставленная прежней версией, получает нынешние правила
+    // перезапуска — см. `service::refresh_restart_on_failure`.
+    #[cfg(windows)]
+    if options.log_to_file {
+        service::refresh_restart_on_failure();
+    }
+
     let demo_servers = options.demo_servers;
     let allow_any_client = options.allow_any_client;
 
@@ -418,15 +428,40 @@ async fn run_daemon(options: DaemonOptions, stop: impl std::future::Future<Outpu
 
     let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
 
+    let heartbeat = watchdog::Heartbeat::new();
+    watchdog::spawn(heartbeat.clone());
+
     let ipc = tokio::spawn(server.run());
-    let sup = tokio::spawn(supervisor.run(cmd_rx, shutdown_rx));
+    let mut sup = tokio::spawn(supervisor.run(cmd_rx, shutdown_rx, heartbeat));
 
     tokio::pin!(stop);
-    tokio::select! {
-        _ = &mut stop => tracing::info!("запрошена остановка"),
-        _ = tokio::signal::ctrl_c() => tracing::info!("получен Ctrl+C"),
-        _ = ipc => tracing::error!("IPC-сервер завершился"),
-    }
+    let ipc_failed = tokio::select! {
+        _ = &mut stop => {
+            tracing::info!("запрошена остановка");
+            false
+        }
+        _ = tokio::signal::ctrl_c() => {
+            tracing::info!("получен Ctrl+C");
+            false
+        }
+        _ = ipc => {
+            tracing::error!("IPC-сервер завершился");
+            true
+        }
+        // Супервизор сам не завершается — только по сигналу, который здесь
+        // ещё не послан. Раз завершился, значит, упал: паника в задаче не
+        // роняет процесс, и прежде демон так и оставался жить без главного
+        // цикла — служба «работает», а соединения нет. Прибрать за ним уже
+        // некому, поэтому выходим сбоем, и диспетчер служб поднимет демон
+        // заново.
+        outcome = &mut sup => {
+            let reason = match outcome {
+                Err(e) if e.is_panic() => "главный цикл демона упал с паникой — перезапускаю службу",
+                _ => "главный цикл демона завершился без команды — перезапускаю службу",
+            };
+            watchdog::die(reason);
+        }
+    };
 
     // Ждём, пока supervisor приберёт за собой.
     //
@@ -437,6 +472,13 @@ async fn run_daemon(options: DaemonOptions, stop: impl std::future::Future<Outpu
     match tokio::time::timeout(Duration::from_secs(15), sup).await {
         Ok(_) => tracing::info!("демон остановлен"),
         Err(_) => tracing::error!("supervisor не завершился за отведённое время"),
+    }
+
+    // Без IPC-сервера демоном нельзя управлять, и штатным завершением это
+    // считать нельзя: служба остановилась бы с нулевым кодом, и диспетчер не
+    // стал бы её поднимать.
+    if ipc_failed {
+        anyhow::bail!("IPC-сервер завершился");
     }
 
     Ok(())
@@ -1186,6 +1228,9 @@ async fn probe_cmd() -> Result<()> {
     Ok(())
 }
 
+/// Сколько `sontd connect` ждёт исхода.
+const CONNECT_WAIT: tokio::time::Duration = tokio::time::Duration::from_secs(90);
+
 async fn connect(server: Option<String>) -> Result<()> {
     use sont_ipc::Event;
 
@@ -1199,7 +1244,10 @@ async fn connect(server: Option<String>) -> Result<()> {
 
     println!("Подключаюсь…");
 
-    let outcome = tokio::time::timeout(tokio::time::Duration::from_secs(60), async {
+    // Дольше, чем занимает самая длинная попытка демона — гонка и вся
+    // последовательность подключения, — чтобы о неудаче сказал он, с причиной,
+    // а не наш таймаут, из которого ничего не понятно.
+    let outcome = tokio::time::timeout(CONNECT_WAIT, async {
         while let Some(event) = events.recv().await {
             match event {
                 Event::StateChanged(state) => match state {
@@ -1234,7 +1282,10 @@ async fn connect(server: Option<String>) -> Result<()> {
             std::process::exit(1);
         }
         Ok(None) => anyhow::bail!("демон разорвал соединение"),
-        Err(_) => anyhow::bail!("подключение не завершилось за 60 секунд"),
+        Err(_) => anyhow::bail!(
+            "подключение не завершилось за {} секунд",
+            CONNECT_WAIT.as_secs()
+        ),
     }
 }
 

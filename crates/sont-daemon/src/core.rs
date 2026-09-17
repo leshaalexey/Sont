@@ -16,6 +16,9 @@ use tokio::process::{Child, Command};
 /// Сколько последних строк вывода ядра держим для диагностики.
 const RECENT_LINES: usize = 20;
 
+/// Сколько ждём выхода ядра после принудительного завершения.
+const EXIT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
 type RecentOutput = Arc<Mutex<VecDeque<String>>>;
 
 #[derive(Debug, thiserror::Error)]
@@ -260,7 +263,18 @@ impl CoreProcess {
         if let Err(e) = child.start_kill() {
             tracing::warn!(error = %e, "не удалось послать сигнал остановки ядру");
         }
-        let _ = child.wait().await;
+        // Не бесконечно. Процесс, у которого потоки застряли в драйвере, после
+        // завершения висит неопределённо долго — у пользователя так ядро с
+        // девятьюстами потоками умирало посреди перехода машины в режим
+        // ожидания. Ожидание без срока держало бы переподключение вечно, а
+        // сигнал завершения уже послан: больше ядру ждать нечего.
+        if tokio::time::timeout(EXIT_WAIT, child.wait()).await.is_err() {
+            tracing::error!(
+                pid = child.id(),
+                seconds = EXIT_WAIT.as_secs(),
+                "ядро не завершилось после сигнала остановки — иду дальше без него"
+            );
+        }
     }
 
     pub fn pid(&self) -> Option<u32> {
